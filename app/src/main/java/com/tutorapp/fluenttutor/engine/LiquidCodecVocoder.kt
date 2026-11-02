@@ -145,6 +145,12 @@ class LiquidCodecVocoder(
             }
         }
 
+        // 碼簿特徵有效性檢查：若輸出全為 0 或常數則代表無有效聲學結構，返回 null 杜絕沙沙白噪音
+        val distinctCount = allCodes.take(minOf(100, allCodes.size)).distinct().size
+        if (distinctCount <= 1) {
+            return null
+        }
+
         return allCodes
     }
 

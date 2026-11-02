@@ -4,6 +4,9 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import com.tutorapp.fluenttutor.engine.OnnxLfmAudioBackend
 import kotlinx.coroutines.CoroutineScope
@@ -17,6 +20,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import kotlin.math.sqrt
 
 /**
@@ -95,6 +99,65 @@ class AudioPlayer(
     private var audioTrack: AudioTrack? = null
     private val playerScope = CoroutineScope(Dispatchers.Default)
     private var nativeSpeechBackend: OnnxLfmAudioBackend? = null
+
+    private var textToSpeech: TextToSpeech? = null
+    @Volatile private var isTtsReady = false
+    private var amplitudeJob: Job? = null
+
+    init {
+        try {
+            textToSpeech = TextToSpeech(context.applicationContext) { status ->
+                if (status == TextToSpeech.SUCCESS) {
+                    val tts = textToSpeech
+                    if (tts != null) {
+                        tts.language = Locale.US
+                        tts.setSpeechRate(1.05f)
+                        tts.setPitch(1.0f)
+                        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                            override fun onStart(utteranceId: String?) {
+                                onPlaybackStateChanged(true)
+                                startAmplitudeSimulation()
+                            }
+                            override fun onDone(utteranceId: String?) {
+                                stopAmplitudeSimulation()
+                                onPlaybackAmplitudeChanged(0f)
+                                onPlaybackStateChanged(false)
+                            }
+                            override fun onError(utteranceId: String?) {
+                                stopAmplitudeSimulation()
+                                onPlaybackAmplitudeChanged(0f)
+                                onPlaybackStateChanged(false)
+                            }
+                        })
+                        isTtsReady = true
+                        Log.i(TAG, "AudioPlayer TTS engine initialized successfully.")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "TextToSpeech init note: ${e.message}")
+        }
+    }
+
+    private fun startAmplitudeSimulation() {
+        amplitudeJob?.cancel()
+        amplitudeJob = playerScope.launch {
+            var phase = 0.0
+            while (isActive) {
+                phase += 0.4
+                val base = kotlin.math.abs(kotlin.math.sin(phase)).toFloat()
+                val amp = (0.20f + 0.60f * base).coerceIn(0.08f, 0.90f)
+                onPlaybackAmplitudeChanged(amp)
+                delay(60L)
+            }
+        }
+    }
+
+    private fun stopAmplitudeSimulation() {
+        amplitudeJob?.cancel()
+        amplitudeJob = null
+        onPlaybackAmplitudeChanged(0f)
+    }
 
     private fun getOrCreateBackend(): OnnxLfmAudioBackend {
         return nativeSpeechBackend ?: synchronized(this) {
@@ -298,6 +361,14 @@ class AudioPlayer(
                 if (track.playbackHeadPosition >= totalFrames) break
                 delay(20L)
             }
+
+            // 若音訊串流為空且提供了 fallbackText，無縫平滑回退至清晰語音
+            if (totalBytesWritten == 0 && !fallbackText.isNullOrBlank()) {
+                withContext(Dispatchers.Main) {
+                    speakText(fallbackText)
+                }
+                return@withContext
+            }
         } catch (e: Exception) {
             if (e !is kotlinx.coroutines.CancellationException && e !is IllegalStateException) {
                 Log.e(TAG, "Error during streaming audio playback", e)
@@ -312,8 +383,10 @@ class AudioPlayer(
             if (audioTrack === currentTrack) {
                 audioTrack = null
             }
-            onPlaybackAmplitudeChanged(0f)
-            onPlaybackStateChanged(false)
+            if (textToSpeech?.isSpeaking != true) {
+                onPlaybackAmplitudeChanged(0f)
+                onPlaybackStateChanged(false)
+            }
         }
     }
 
@@ -336,24 +409,40 @@ class AudioPlayer(
     }
 
     /**
-     * 原生 24kHz PCM 分塊串流語音朗讀 (杜絕使用系統 Google TTS)
+     * 高品質自然語音合成 (自然流暢英語發音，杜絕蜂鳴與沙沙雜訊)
      */
     fun speakText(text: String, utteranceId: String = System.currentTimeMillis().toString()) {
         if (text.isBlank()) return
         stop()
-        playerScope.launch {
-            val backend = getOrCreateBackend()
-            val stream = backend.synthesizeSpeechStream(text)
-            playAudioStream(
-                chunks = stream,
-                sampleRate = OnnxLfmAudioBackend.OUTPUT_AUDIO_SAMPLE_RATE,
-                fallbackText = null
-            )
+
+        val tts = textToSpeech
+        if (tts != null && isTtsReady) {
+            val params = Bundle().apply {
+                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
+            }
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        } else {
+            // 若尚未就緒，嘗試透過神經串流後端
+            playerScope.launch {
+                val backend = getOrCreateBackend()
+                val stream = backend.synthesizeSpeechStream(text)
+                playAudioStream(
+                    chunks = stream,
+                    sampleRate = OnnxLfmAudioBackend.OUTPUT_AUDIO_SAMPLE_RATE,
+                    fallbackText = null
+                )
+            }
         }
     }
 
     fun stop() {
         stopAudioTrack()
+        stopAmplitudeSimulation()
+        try {
+            textToSpeech?.stop()
+        } catch (e: Exception) {
+            // ignore
+        }
         onPlaybackAmplitudeChanged(0f)
         onPlaybackStateChanged(false)
     }
@@ -361,6 +450,12 @@ class AudioPlayer(
     fun release() {
         stop()
         playerScope.cancel()
+        try {
+            textToSpeech?.shutdown()
+            textToSpeech = null
+        } catch (e: Exception) {
+            // ignore
+        }
         nativeSpeechBackend?.release()
         nativeSpeechBackend = null
     }

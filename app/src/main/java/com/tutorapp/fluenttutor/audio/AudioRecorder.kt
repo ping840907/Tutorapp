@@ -34,9 +34,10 @@ class AudioRecorder(
         private const val TAG = "AudioRecorder"
         private const val PRE_ROLL_CAPACITY_BYTES = 16000 * 2 * 3 / 10 // 300ms 前導環形緩存
         private const val MAX_MANUAL_BUFFER_BYTES = 16000 * 2 * 30    // 手動錄音上限 30 秒 (約 960KB)
-        private const val MIN_SEGMENT_DURATION_MS = 200L               // 最短有效語音時長 (支援 short utterances)
-        private const val BARGE_IN_RMS_THRESHOLD = 1100f               // 打斷偵測能量門檻 (大於喇叭洩漏底噪)
+        private const val MIN_SEGMENT_DURATION_MS = 150L               // 最短有效語音時長 (支援 short utterances)
+        private const val BARGE_IN_RMS_THRESHOLD = 500f                // 打斷偵測能量門檻
         private const val BARGE_IN_CONSECUTIVE_FRAMES = 2              // 連續 2 幀確認打斷 (約 120ms)
+        private const val INPUT_GAIN = 1.4f                            // 麥克風前級增益 (提升低語音量)
     }
 
     private val lock = Any()
@@ -85,6 +86,38 @@ class AudioRecorder(
         }
     }
 
+    private fun createAudioRecord(bufSize: Int): AudioRecord? {
+        val sources = listOf(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        )
+        for (source in sources) {
+            try {
+                val record = AudioRecord(
+                    source,
+                    sampleRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufSize
+                )
+                if (record.state == AudioRecord.STATE_INITIALIZED) {
+                    val name = when (source) {
+                        MediaRecorder.AudioSource.VOICE_RECOGNITION -> "VOICE_RECOGNITION"
+                        MediaRecorder.AudioSource.MIC -> "MIC"
+                        else -> "VOICE_COMMUNICATION"
+                    }
+                    Log.i(TAG, "AudioRecord successfully initialized with source: $name ($sampleRate Hz)")
+                    return record
+                }
+                record.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to initialize AudioRecord with source $source: ${e.message}")
+            }
+        }
+        return null
+    }
+
     @SuppressLint("MissingPermission")
     fun startRecording(coroutineScope: CoroutineScope): Boolean {
         if (isRecording) return true
@@ -95,18 +128,9 @@ class AudioRecorder(
         val bufferSize = maxOf(minBufferSize, 2048)
 
         try {
-            // 使用 VOICE_COMMUNICATION 啟用高通 SM8850 底層硬體回音消除 (AEC)
-            val record = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
-
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord initialization failed")
-                record.release()
+            val record = createAudioRecord(bufferSize)
+            if (record == null) {
+                Log.e(TAG, "AudioRecord initialization failed for all available audio sources")
                 return false
             }
 
@@ -140,6 +164,11 @@ class AudioRecorder(
                     val currentRecord = audioRecord ?: break
                     val readCount = currentRecord.read(shortBuffer, 0, shortBuffer.size)
                     if (readCount > 0) {
+                        // 應用前級增益提升收音靈敏度
+                        for (idx in 0 until readCount) {
+                            val scaled = (shortBuffer[idx] * INPUT_GAIN).toInt().coerceIn(-32768, 32767)
+                            shortBuffer[idx] = scaled.toShort()
+                        }
                         // 若處於 AI 發言期間，依然進行高能量打斷偵測 (Barge-in detection)
                         if (isHalfDuplexMuted) {
                             val muteRms = vad.calculateRms(shortBuffer, readCount)

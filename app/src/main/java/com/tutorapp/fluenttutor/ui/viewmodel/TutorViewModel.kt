@@ -387,6 +387,9 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendManualText(text: String) {
         if (text.isBlank()) return
+        // 手動輸入時主動打斷當前正在播放的 AI 語音，釋放半雙工鎖
+        audioPlayer.stop()
+        _uiState.update { it.copy(isAiSpeaking = false, aiAmplitude = 0f) }
         enqueueAudioSegment(null, 0L, manualText = text)
     }
 

@@ -12,9 +12,9 @@ import kotlin.math.sqrt
  */
 class VoiceActivityDetector(
     private val sampleRate: Int = 16000,
-    private val silenceThresholdMs: Long = 650L,   // 斷句判定靜音長度
-    private val minSpeechDurationMs: Long = 200L,  // 有效語音最短長度 (支援短語音回答)
-    private var baseEnergyThreshold: Float = 550f
+    private val silenceThresholdMs: Long = 500L,   // 斷句判定靜音長度
+    private val minSpeechDurationMs: Long = 150L,  // 有效語音最短長度 (支援短語音回答)
+    private var baseEnergyThreshold: Float = 220f
 ) {
     enum class VadState {
         SILENCE,
@@ -23,7 +23,7 @@ class VoiceActivityDetector(
     }
 
     private var currentState: VadState = VadState.SILENCE
-    private var noiseFloor: Float = 250f
+    private var noiseFloor: Float = 100f
     private var processedSamplesTotal: Long = 0L
     private var speechStartSample: Long = 0L
     private var lastSpeechSample: Long = 0L
@@ -46,8 +46,8 @@ class VoiceActivityDetector(
 
         // 僅在靜音時緩慢跟隨背景噪聲，避免把說話能量混入噪聲基線
         if (currentState == VadState.SILENCE) {
-            noiseFloor = 0.96f * noiseFloor + 0.04f * rms
-            baseEnergyThreshold = (noiseFloor * 2.2f).coerceIn(400f, 2200f)
+            noiseFloor = 0.95f * noiseFloor + 0.05f * rms
+            baseEnergyThreshold = (noiseFloor * 1.8f).coerceIn(160f, 1500f)
         }
         return rms
     }
