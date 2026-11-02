@@ -195,6 +195,8 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         stateMachine = MissionStateMachine(scenario)
         missionState = stateMachine.initialState()
 
+        val dynamicGreeting = s2sEngine.generateGreeting(scenario)
+
         _uiState.update {
             it.copy(
                 currentScenario = scenario,
@@ -202,7 +204,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 messages = listOf(
                     ChatMessage(
                         sender = MessageSender.TUTOR,
-                        text = scenario.initialGreeting
+                        text = dynamicGreeting
                     )
                 ),
                 isRecording = false,
@@ -223,12 +225,13 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語 (優先走 LFM3 端側分塊串流直出，防螢幕旋轉重複播放)
+     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語 (防螢幕旋轉重複播放)
      */
     fun playGreetingOnScreenEnter() {
         if (_uiState.value.hasPlayedInitialGreeting) return
         _uiState.update { it.copy(hasPlayedInitialGreeting = true) }
-        val greeting = _uiState.value.currentScenario.initialGreeting
+        val greeting = _uiState.value.messages.firstOrNull { it.sender == MessageSender.TUTOR }?.text
+            ?: s2sEngine.generateGreeting(_uiState.value.currentScenario)
         viewModelScope.launch {
             val audioBytes = s2sEngine.synthesizeSpeech(greeting)
             if (audioBytes != null && audioBytes.isNotEmpty()) {

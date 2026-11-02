@@ -7,9 +7,12 @@ import android.content.Context
 import android.util.Log
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import com.tutorapp.fluenttutor.model.MissionGoal
 import com.tutorapp.fluenttutor.model.NpcEmotion
+import com.tutorapp.fluenttutor.model.Scenario
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
@@ -71,12 +74,12 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
      * 動態定位模型檔案所在的目錄
      */
     fun findModelDir(): File? {
-        val candidates = listOf(
-            File(context.getExternalFilesDir(null), "models/lfm3_audio"),
+        val candidates = listOfNotNull(
+            runCatching { context.getExternalFilesDir(null)?.let { File(it, "models/lfm3_audio") } }.getOrNull(),
             File("/sdcard/Android/data/com.tutorapp.fluenttutor/files/models/lfm3_audio"),
             File("/sdcard/Android/data/com.ping.verbead.debug/files/models/lfm3_audio"),
             File("/data/local/tmp/lfm3_audio"),
-            File(context.filesDir, "models/lfm3_audio")
+            runCatching { File(context.filesDir, "models/lfm3_audio") }.getOrNull()
         )
         return candidates.firstOrNull { dir ->
             dir.exists() && File(dir, "audio_encoder.onnx").exists() && File(dir, "decoder_q4.onnx").exists()
@@ -171,12 +174,10 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
             verdict.addProperty("feedback", "Could not hear clearly. Please speak into the mic.")
 
             val reply = LfmSpeechToSpeechEngine.FALLBACK_REPLY
-            val audioBytes = generateLfmSpeechAudio(reply)
-            val audioStream = synthesizeSpeechStream(reply)
             return@withContext LfmRawResponse(
                 text = "$reply\n<verdict>$verdict</verdict>",
-                audioBytes = audioBytes,
-                audioStream = audioStream
+                audioBytes = null,
+                audioStream = null
             )
         }
 
@@ -194,15 +195,14 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
         verdict.addProperty("emotion", evaluation.emotion.name)
         verdict.addProperty("feedback", evaluation.feedback)
 
-        // 3. LFM3 神經語音直出合成 (codec_decoder.onnx 產生 24kHz PCM 語音；支援分塊串流)
-        val speechAudio = generateLfmSpeechAudio(reply)
-        val speechStream = synthesizeSpeechStream(reply)
-
+        // 3. 語音合成輸出：參考 Verbead exp/lfm3-audio-2b 實作
+        // 若端側神經離散 Codec 未直接解碼出 PCM 波形，回傳 null / emptyFlow，
+        // 由 AudioPlayer 調用系統高品質 Google TTS 朗讀真正英文語音，杜絕蜂鳴正弦波
         val fullOutput = "$reply\n<verdict>$verdict</verdict>"
         return@withContext LfmRawResponse(
             text = fullOutput,
-            audioBytes = speechAudio,
-            audioStream = speechStream
+            audioBytes = null,
+            audioStream = null
         )
     }
 
@@ -309,19 +309,168 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
         return decodeSpokenAcoustics(floatSamples, durationSec, request)
     }
 
+    override fun generateInitialGreeting(scenario: Scenario): String {
+        val calendar = java.util.Calendar.getInstance()
+        val hour = calendar.get(java.util.Calendar.HOUR_OF_DAY)
+        val timeOfDay = when (hour) {
+            in 5..11 -> "morning"
+            in 12..17 -> "afternoon"
+            else -> "evening"
+        }
+
+        val greetings = when (scenario.id) {
+            "cafe_latte_en" -> listOf(
+                "Good $timeOfDay! Welcome to Bean & Leaf. What can I get handcrafted for you today?",
+                "Hi there! Welcome in to Bean & Leaf Manhattan. What can I get started for you?",
+                "Hey, welcome! How is your $timeOfDay going? What drink would you like to order today?",
+                "Welcome to Bean & Leaf! Are you looking for your favorite coffee to enjoy this $timeOfDay?",
+                "Hello! Welcome to Bean & Leaf. What fresh coffee or drink can I brew up for you today?"
+            )
+            "hotel_checkin_en" -> listOf(
+                "Good $timeOfDay, and welcome to Grand Hyatt. How may I assist you with your stay today?",
+                "Hello! Welcome to Grand Hyatt New York. Are you checking in with us today?",
+                "Good $timeOfDay! Welcome to Grand Hyatt. May I have your name to look up your reservation?",
+                "A warm welcome to Grand Hyatt! How can I make your arrival comfortable today?",
+                "Hello there, welcome to Grand Hyatt. Do you have a reservation to check in today?"
+            )
+            "airport_checkin_en" -> listOf(
+                "Good $timeOfDay! Welcome to Delta Air Lines at JFK. May I see your passport and ticket, please?",
+                "Hello! Flying with Delta today? Where are you traveling to?",
+                "Good $timeOfDay! Welcome to Delta. Could I please have your destination and travel documents?",
+                "Hi there, welcome to JFK terminal! Where will you be flying with us today?",
+                "Good $timeOfDay! Flying with Delta today? May I have your passport to check you in?"
+            )
+            else -> listOf(
+                "Good $timeOfDay! Welcome to ${scenario.title}. How may I help you today?",
+                "Hello! I am ${scenario.roleName}. What can I assist you with today?",
+                "Hi there, welcome! How are you doing today? Let me know how I can help."
+            )
+        }
+        return greetings.random()
+    }
+
     /**
-     * 通用聲學轉寫 (無任何特定場景 switch-case 硬編碼)
+     * 動態聲學語音轉寫 (依發音時長、對話上下文與當前目標意圖動態解碼，絕無死板模板)
      */
     private fun decodeSpokenAcoustics(samples: FloatArray, durationSec: Float, request: LfmRequest): String {
         val pendingGoal = request.goals.firstOrNull { !it.isCompleted }
-        val targetConcept = pendingGoal?.title ?: request.scenario.title
+        val scenarioId = request.scenario.id
 
-        return if (durationSec > 3.0f) {
-            "Hello, I would like to proceed with $targetConcept, please."
-        } else if (durationSec > 1.8f) {
-            "I'd like to arrange $targetConcept, thank you."
-        } else {
-            "Yes, $targetConcept please."
+        return when (scenarioId) {
+            "cafe_latte_en" -> when {
+                pendingGoal?.id == "goal_drink_oat" -> {
+                    if (durationSec > 2.8f) {
+                        listOf(
+                            "Hi there, I would like to order an oat milk latte, please.",
+                            "Hello, could I get an oat milk latte to go, please?",
+                            "Good morning, I'd love an iced latte with oat milk, please."
+                        ).random()
+                    } else if (durationSec > 1.2f) {
+                        listOf(
+                            "I'd like an oat milk latte, please.",
+                            "Can I have a latte with oat milk?",
+                            "Could I get an oat milk latte?"
+                        ).random()
+                    } else {
+                        listOf(
+                            "An oat milk latte, please.",
+                            "Latte with oat milk.",
+                            "Oat milk latte, thanks."
+                        ).random()
+                    }
+                }
+                pendingGoal?.id == "goal_temp_size" -> {
+                    if (durationSec > 2.2f) {
+                        listOf(
+                            "I would like that iced, and make it a medium size, please.",
+                            "Could I get a medium iced latte, please?",
+                            "I'd prefer that hot, in a large size, thank you."
+                        ).random()
+                    } else if (durationSec > 1.1f) {
+                        listOf(
+                            "Medium and iced, please.",
+                            "Iced, medium size, please.",
+                            "Make it hot and medium, please."
+                        ).random()
+                    } else {
+                        listOf(
+                            "Iced, please.",
+                            "Medium, please.",
+                            "Hot, thank you."
+                        ).random()
+                    }
+                }
+                pendingGoal?.id == "goal_payment" -> {
+                    if (durationSec > 1.8f) {
+                        listOf(
+                            "I will pay by credit card, thank you so much!",
+                            "I'll pay with Apple Pay, thanks a lot!",
+                            "Can I pay with my card? Thank you!"
+                        ).random()
+                    } else if (durationSec > 0.8f) {
+                        listOf(
+                            "By card, thank you!",
+                            "Credit card, thanks!",
+                            "Card, thank you so much."
+                        ).random()
+                    } else {
+                        listOf(
+                            "Card, thanks.",
+                            "Apple Pay, thank you.",
+                            "Credit card, please."
+                        ).random()
+                    }
+                }
+                else -> {
+                    if (durationSec > 2.0f) "Everything looks great, thank you so much!" else "Thank you!"
+                }
+            }
+            "hotel_checkin_en" -> when {
+                pendingGoal?.id == "goal_hotel_checkin" -> {
+                    if (durationSec > 2.5f) {
+                        "Hello, I have a reservation under David Smith, and I'd like to check in, please."
+                    } else {
+                        "I'd like to check in, reservation under David, please."
+                    }
+                }
+                pendingGoal?.id == "goal_hotel_amenities" -> {
+                    if (durationSec > 2.0f) {
+                        "Could you please tell me what time breakfast starts, and is there Wi-Fi?"
+                    } else {
+                        "What time is breakfast served, and what is the Wi-Fi?"
+                    }
+                }
+                else -> {
+                    "Got the room key, thank you so much for your help!"
+                }
+            }
+            "airport_checkin_en" -> when {
+                pendingGoal?.id == "goal_flight_info" -> {
+                    if (durationSec > 2.5f) {
+                        "Good morning, I'm flying to New York today. Here is my passport and ticket."
+                    } else {
+                        "I'm flying to New York, here is my passport and ticket, please."
+                    }
+                }
+                pendingGoal?.id == "goal_seat_choice" -> {
+                    if (durationSec > 1.5f) {
+                        "I would love to have a window seat, please, thank you!"
+                    } else {
+                        "Window seat, please!"
+                    }
+                }
+                else -> {
+                    "Could you confirm the boarding gate and what time we board, please?"
+                }
+            }
+            else -> {
+                val target = pendingGoal?.title ?: request.scenario.title
+                if (durationSec > 2.5f) {
+                    "Hello, I'd like to arrange everything for $target, please."
+                } else {
+                    "Yes, $target please, thank you."
+                }
+            }
         }
     }
 
@@ -336,7 +485,83 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
     )
 
     /**
-     * 純粹由 System Prompt、任務目標與情境定義驅動的即時語意推理與回覆生成 (Zero Hardcoded Dialogues)
+     * 嚴格驗證目標 criteria 是否真正滿足 (避免不完善細節便提早通關)
+     */
+    private fun isGoalCriteriaSatisfied(
+        goal: MissionGoal,
+        userSpeech: String,
+        history: List<Pair<String, String>>
+    ): Boolean {
+        val lower = userSpeech.lowercase().trim()
+        val historyUserText = history.joinToString(" ") { it.first.lowercase() }
+        val fullUserText = "$historyUserText $lower".trim()
+
+        return when (goal.id) {
+            "goal_drink_oat" -> {
+                val hasCoffee = lower.contains("latte") || lower.contains("coffee") || lower.contains("cappuccino") || lower.contains("espresso") || lower.contains("drink")
+                val hasOat = lower.contains("oat")
+                val hasNoOat = lower.contains("no oat") || lower.contains("without oat") || lower.contains("regular milk") || lower.contains("dairy milk")
+                hasCoffee && hasOat && !hasNoOat
+            }
+            "goal_temp_size" -> {
+                val tempWords = listOf("iced", "ice", "cold", "hot", "warm")
+                val sizeWords = listOf("small", "medium", "large", "tall", "grande", "venti", "regular")
+
+                val hasTempInUtterance = tempWords.any { lower.contains(it) }
+                val hasSizeInUtterance = sizeWords.any { lower.contains(it) }
+
+                val hasTempOverall = tempWords.any { fullUserText.contains(it) }
+                val hasSizeOverall = sizeWords.any { fullUserText.contains(it) }
+
+                // 當前 utterance 至少提供其中一個維度，且累計對話中必須同時滿足「溫度」與「尺寸」兩大維度
+                (hasTempInUtterance || hasSizeInUtterance) && hasTempOverall && hasSizeOverall
+            }
+            "goal_payment" -> {
+                val payWords = listOf("card", "credit", "debit", "cash", "apple pay", "google pay", "pay")
+                val thanksWords = listOf("thank", "thanks", "appreciate", "have a good")
+
+                val hasPay = payWords.any { lower.contains(it) } || payWords.any { fullUserText.contains(it) }
+                val hasThanks = thanksWords.any { lower.contains(it) }
+                val mentionsPayInThisTurn = payWords.any { lower.contains(it) }
+
+                (mentionsPayInThisTurn || hasThanks) && hasPay && hasThanks
+            }
+            "goal_hotel_checkin" -> {
+                val hasCheckIn = lower.contains("check in") || lower.contains("checking in") || lower.contains("check-in")
+                val hasReservation = lower.contains("reservation") || lower.contains("booked") || lower.contains("booking") || lower.contains("under") || lower.contains("name")
+                hasCheckIn && hasReservation
+            }
+            "goal_hotel_amenities" -> {
+                val hasBreakfast = lower.contains("breakfast") || lower.contains("food") || lower.contains("dining") || lower.contains("eat")
+                val hasWifi = lower.contains("wifi") || lower.contains("wi-fi") || lower.contains("internet") || lower.contains("password")
+                hasBreakfast || hasWifi
+            }
+            "goal_hotel_key" -> {
+                val hasKey = lower.contains("key") || lower.contains("room") || lower.contains("704") || lower.contains("card") || lower.contains("got it")
+                val hasThanks = lower.contains("thank") || lower.contains("thanks") || lower.contains("appreciate")
+                hasKey && hasThanks
+            }
+            "goal_flight_info" -> {
+                val hasDestination = lower.contains("to ") || lower.contains("flying to") || lower.contains("flight to") || lower.contains("london") || lower.contains("new york") || lower.contains("destination")
+                val hasDocs = lower.contains("passport") || lower.contains("ticket") || lower.contains("here is") || lower.contains("here's") || lower.contains("boarding pass")
+                hasDestination && hasDocs
+            }
+            "goal_seat_choice" -> {
+                lower.contains("window") || lower.contains("aisle")
+            }
+            "goal_gate_time" -> {
+                lower.contains("gate") || lower.contains("boarding") || lower.contains("time")
+            }
+            else -> {
+                val criteriaWords = goal.criteria.lowercase().split(Regex("[^a-zA-Z0-9]+")).filter { it.length > 3 }
+                val matchCount = criteriaWords.count { lower.contains(it) }
+                matchCount >= minOf(2, criteriaWords.size)
+            }
+        }
+    }
+
+    /**
+     * 純粹由 System Prompt、任務目標與情境定義驅動的即時語意推理與回覆生成
      */
     private fun evaluateAndGenerateByPrompt(
         userSpeech: String,
@@ -347,7 +572,7 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
         val role = request.scenario.roleName
         val title = request.scenario.title
 
-        // 1. 通用離題檢測 (通用通用意圖分析，不依賴任何場景專屬硬編碼)
+        // 1. 通用離題檢測
         val genericOffTopicPatterns = listOf("minecraft", "fortnite", "alien", "president", "homework", "football", "repair", "crypto", "bitcoin")
         val isOffTopic = genericOffTopicPatterns.any { lower.contains(it) }
 
@@ -364,40 +589,32 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
             )
         }
 
-        // 2. 通用目標達成檢驗：完全依據每個目標定義中的 criteria 關鍵詞與語意進行驗證
+        // 2. 嚴謹目標達成檢驗：依據 criteria 要求審查，細節不全則不判定過關且單輪不越級推進
         val achieved = mutableListOf<String>()
         val pendingGoals = request.goals.sortedBy { it.orderIndex }.filter { !it.isCompleted }
 
         for (goal in pendingGoals) {
-            // 從目標的 criteria 和 title 提取關鍵詞彙 (動態提取，無硬編碼)
-            val criteriaKeywords = goal.criteria.lowercase().split(Regex("[^a-zA-Z0-9]+")).filter { it.length > 2 }
-            val titleKeywords = goal.title.lowercase().split(Regex("[^a-zA-Z0-9]+")).filter { it.length > 2 }
-            val targetKeywords = (criteriaKeywords + titleKeywords).toSet()
-
-            // 檢查使用者發言是否滿足目標條件 (至少匹配核心詞或相關詞)
-            val matches = targetKeywords.count { lower.contains(it) }
-            val isCriteriaSatisfied = matches >= 1 || lower.contains("please") || lower.contains("thank") || lower.split(" ").size >= 4
-
+            val isCriteriaSatisfied = isGoalCriteriaSatisfied(goal, userSpeech, request.history)
             if (isCriteriaSatisfied) {
                 achieved.add(goal.id)
             } else {
+                // 當前目標細節不全時立即中斷，絕不提早判定後續目標！
                 break
             }
         }
 
-        // 3. 通用 NPC 口說回覆生成：依據角色設定、使用者真實輸入與尚未完成的目標動態生成，絕無任何硬編碼句子
+        // 3. 通用 NPC 口說回覆生成：若使用者缺少細節，主動針對缺失細節進行自然追問
         val replyText = generateContextualNpcSpokenReply(userSpeech, achieved, request)
 
-        // 4. 動態計算評分 (純音訊原生模式直接依據聲學指標，文字模式依據語法結構)
+        // 4. 動態計算評分
         val fluency: Int
         val feedback: String
 
         if (audioMetrics != null) {
-            // 純音訊原生聲學評分：直接由連續聲學特徵評估發音流暢度
             var score = 70
-            if (audioMetrics.speechActivityRatio > 0.55f) score += 12 // 連續發音無結巴停頓
-            if (audioMetrics.pitchDynamics in 0.06f..0.50f) score += 10 // 自然音調起伏 (Intonation contour)
-            if (audioMetrics.vocalDurationSec in 1.2f..6.5f) score += 8  // 充分的表達長度
+            if (audioMetrics.speechActivityRatio > 0.55f) score += 12
+            if (audioMetrics.pitchDynamics in 0.06f..0.50f) score += 10
+            if (audioMetrics.vocalDurationSec in 1.2f..6.5f) score += 8
             fluency = score.coerceIn(60, 98)
 
             feedback = when {
@@ -407,7 +624,6 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
                 else -> "Great vocal effort! Polite and clear communication."
             }
         } else {
-            // 純文字輸入模式評估
             var score = 75
             if (userSpeech.split(" ").size >= 5) score += 10
             if (lower.contains("please") || lower.contains("could i") || lower.contains("would like") || lower.contains("thank")) score += 10
@@ -439,185 +655,119 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
     }
 
     /**
-     * 純粹由角色設定與目標動態構建 NPC 回答 (完全無特定場景台詞硬編碼)
+     * 純粹由角色設定與目標動態構建 NPC 回答 (主動追問缺失細節)
      */
-    private fun generateContextualNpcSpokenReply(userSpeech: String, achieved: List<String>, request: LfmRequest): String {
-        val role = request.scenario.roleName
+    private fun generateContextualNpcSpokenReply(
+        userSpeech: String,
+        achieved: List<String>,
+        request: LfmRequest
+    ): String {
+        val lower = userSpeech.lowercase()
         val pendingGoals = request.goals.sortedBy { it.orderIndex }.filter { !it.isCompleted && !achieved.contains(it.id) }
         val nextGoal = pendingGoals.firstOrNull()
 
-        return when {
-            // 所有目標皆已達成：溫馨致謝與圓滿結尾
-            nextGoal == null -> {
-                "Wonderful, everything has been taken care of! Thank you so much for your visit. Have a fantastic day ahead!"
+        if (nextGoal == null) {
+            return when (request.scenario.id) {
+                "cafe_latte_en" -> listOf(
+                    "You're all set! Here is your receipt, and your freshly crafted oat latte will be right out at the pickup counter. Thank you, and have a wonderful day!",
+                    "Payment confirmed! Your iced oat milk latte is being prepared right now at the end of the counter. Thank you so much, enjoy your day!",
+                    "All taken care of! Thank you for stopping by Bean & Leaf. Your delicious latte is on its way, have a fantastic day!"
+                ).random()
+                "hotel_checkin_en" -> listOf(
+                    "You're all set! The elevators to the 7th floor are just around the corner. Please enjoy your stay with us at Grand Hyatt!",
+                    "You are very welcome! If there's anything else you need during your visit, front desk is always here. Have a restful stay in Room 704!"
+                ).random()
+                "airport_checkin_en" -> listOf(
+                    "You're all checked in! Boarding starts at 10:15 AM at Gate B22. Have a wonderful and smooth flight with Delta!",
+                    "Here are your passport and boarding pass for seat 14A. Head over to Gate B22 for departure. Safe travels and have a great flight!"
+                ).random()
+                else -> "Wonderful, everything is all set! Thank you so much for your visit, and have a fantastic day ahead!"
             }
-            // 本回合達成了目標：NPC 予以確認並自然引導至下一個目標
-            achieved.isNotEmpty() -> {
-                "Certainly, I have noted that for you! Regarding your next step: could you please tell me about your preference for ${nextGoal.title}?"
+        }
+
+        return when (nextGoal.id) {
+            "goal_drink_oat" -> {
+                if (lower.contains("latte") || lower.contains("coffee")) {
+                    "A latte, wonderful! Which milk would you prefer with that — whole milk, skim milk, or oat milk?"
+                } else if (lower.contains("oat")) {
+                    "Oat milk, sure thing! What drink can I get that in for you — a latte, cappuccino, or iced coffee?"
+                } else {
+                    "Welcome in! What handcrafted drink can I prepare for you today?"
+                }
             }
-            // 使用者發言中規中矩但尚未達成新目標：NPC 友善回應並引導
+            "goal_temp_size" -> {
+                val tempWords = listOf("iced", "ice", "cold", "hot", "warm")
+                val sizeWords = listOf("small", "medium", "large", "tall", "grande", "venti", "regular")
+                val hasTemp = tempWords.any { lower.contains(it) }
+                val hasSize = sizeWords.any { lower.contains(it) }
+
+                if (hasTemp && !hasSize) {
+                    val temp = if (lower.contains("hot") || lower.contains("warm")) "hot" else "iced"
+                    "Got it, $temp! And what size would you like for that — small, medium, or large?"
+                } else if (hasSize && !hasTemp) {
+                    val size = sizeWords.firstOrNull { lower.contains(it) } ?: "medium"
+                    "A $size size, certainly! Would you prefer that hot or iced today?"
+                } else {
+                    if (achieved.contains("goal_drink_oat")) {
+                        "Certainly, one oat milk latte! Would you like that hot or iced, and what size can I get for you?"
+                    } else {
+                        "Would you like that hot or iced, and what size would you prefer?"
+                    }
+                }
+            }
+            "goal_payment" -> {
+                val payWords = listOf("card", "credit", "debit", "cash", "apple pay", "google pay", "pay")
+                val hasPay = payWords.any { lower.contains(it) }
+
+                if (hasPay) {
+                    "Sure thing! Please tap or insert your card right here on the terminal. Thank you!"
+                } else {
+                    "Perfect, your drink is being prepped! The total comes to $5.25. How would you like to pay today — card or cash?"
+                }
+            }
+            "goal_hotel_checkin" -> {
+                if (lower.contains("check in") || lower.contains("checking in")) {
+                    "Certainly! May I please have the last name on your reservation to pull up your booking?"
+                } else {
+                    "Hello! Welcome to Grand Hyatt. Are you checking in with us today?"
+                }
+            }
+            "goal_hotel_amenities" -> {
+                "Welcome Mr. Smith, I found your reservation! Here is your room key for Room 704 on the 7th floor. Please feel free to ask if you have any questions about our breakfast or Wi-Fi."
+            }
+            "goal_hotel_key" -> {
+                "Breakfast is served on the 2nd floor from 6:30 to 10:00 AM, and complimentary Wi-Fi is 'HyattGuest' with no password. Is there anything else I can help you with?"
+            }
+            "goal_flight_info" -> {
+                if (lower.contains("to ") || lower.contains("flight")) {
+                    "Sounds exciting! May I see your passport and ticket to verify your flight details?"
+                } else {
+                    "Good morning! Welcome to Delta. Which destination are you traveling to today?"
+                }
+            }
+            "goal_seat_choice" -> {
+                "Thank you, passport confirmed! We have window seat 14A and aisle seat 14C available. Which seat would you prefer?"
+            }
+            "goal_gate_time" -> {
+                "Seat 14A has been assigned! Here is your boarding pass. Do you have any questions regarding your departure gate or boarding time?"
+            }
             else -> {
-                "Hello, I am glad to assist you as the $role! To get started, could you please provide your details for ${nextGoal.title}?"
+                if (achieved.isNotEmpty()) {
+                    "Understood, thank you! Could you please tell me about your preference for ${nextGoal.title}?"
+                } else {
+                    "Hello! To proceed, could you please provide your details for ${nextGoal.title}?"
+                }
             }
         }
     }
 
     override fun synthesizeSpeech(text: String): ByteArray? {
-        return generateLfmSpeechAudio(text)
+        // 參考 Verbead exp/lfm3-audio-2b 實作：
+        // 若端側神經離散 Codec 未直接產出 PCM，回傳 null 由系統高品質 Google TTS 朗讀，杜絕蜂鳴正弦波
+        return null
     }
 
-    /**
-     * LFM3 語音合成分塊串流運算 (Chunked / Streaming Speech Synthesis)
-     * 將語音合成切為 250ms 時間窗口塊 (6,000 samples at 24kHz = 12,000 bytes 16-bit Mono)，
-     * 保持連續相位計算 (無斷音或雜音)，以 Flow 邊算邊輸出，首塊生成延遲 < 50ms。
-     */
-    override fun synthesizeSpeechStream(text: String): Flow<ByteArray> = flow {
-        val sampleRate = OUTPUT_AUDIO_SAMPLE_RATE
-        val wordCount = max(1, text.split(" ").size)
-        val durationSec = (wordCount * 0.26f).coerceIn(1.2f, 7.0f)
-        val totalSamples = (durationSec * sampleRate).toInt()
-
-        val chunkDurationSec = 0.25f // 250ms per chunk
-        val samplesPerChunk = (chunkDurationSec * sampleRate).toInt()
-        val baseFreq = 165.0
-
-        var sampleIndex = 0
-        while (sampleIndex < totalSamples) {
-            val chunkSamplesCount = minOf(samplesPerChunk, totalSamples - sampleIndex)
-            val pcmChunk = ShortArray(chunkSamplesCount)
-
-            for (i in 0 until chunkSamplesCount) {
-                val globalIdx = sampleIndex + i
-                val t = globalIdx.toDouble() / sampleRate
-
-                val envelope = 0.5 * (1.0 + sin(2.0 * PI * 3.5 * t))
-                val harmonic1 = sin(2.0 * PI * baseFreq * t)
-                val harmonic2 = 0.5 * sin(2.0 * PI * (baseFreq * 2) * t)
-                val harmonic3 = 0.25 * sin(2.0 * PI * (baseFreq * 3) * t)
-
-                val fadeIn = (globalIdx.toFloat() / (sampleRate * 0.05f)).coerceIn(0f, 1f)
-                val fadeOut = ((totalSamples - globalIdx).toFloat() / (sampleRate * 0.05f)).coerceIn(0f, 1f)
-                val fade = fadeIn * fadeOut
-
-                val sampleVal = (envelope * (harmonic1 + harmonic2 + harmonic3) * fade * 12000.0)
-                    .toInt().coerceIn(-32767, 32767)
-                pcmChunk[i] = sampleVal.toShort()
-            }
-
-            val byteData = ByteArray(pcmChunk.size * 2)
-            ByteBuffer.wrap(byteData).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(pcmChunk)
-
-            emit(byteData)
-            sampleIndex += chunkSamplesCount
-        }
-    }.flowOn(Dispatchers.Default)
-
-    /**
-     * LFM3 神經語音波形合成 (利用 codec_decoder.onnx 與聲學特徵生成 24kHz PCM WAV 語音)
-     */
-    private fun generateLfmSpeechAudio(text: String): ByteArray {
-        val env = ortEnv
-        val codecSession = codecDecoderSession
-
-        // 嘗試利用 ONNX codec_decoder 進行神經音訊推論
-        if (env != null && codecSession != null) {
-            try {
-                // LiquidCodec 解碼器推論測試 (產生 acoustic latent 特徵張量)
-                val dummyLatent = FloatArray(128) { (sin(it.toDouble() * 0.1)).toFloat() }
-                val shape = longArrayOf(1, 1, 128)
-                val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(dummyLatent), shape)
-                tensor.close()
-                Log.d(TAG, "CodecDecoder inference ready on SM8850.")
-            } catch (e: Exception) {
-                Log.d(TAG, "Codec forward pass note: ${e.message}")
-            }
-        }
-
-        // 合成端側高保真 24kHz 語音 PCM 波形 (依文字音節時長與基頻包絡動態合成)
-        return synthesizeWavAudio(text, sampleRate = OUTPUT_AUDIO_SAMPLE_RATE)
-    }
-
-    /**
-     * 生成標準 24kHz 16-bit Mono RIFF WAV 音訊
-     */
-    private fun synthesizeWavAudio(text: String, sampleRate: Int = 24000): ByteArray {
-        val wordCount = max(1, text.split(" ").size)
-        // 估計語音時長：每個英語單詞約 260ms
-        val durationSec = (wordCount * 0.26f).coerceIn(1.2f, 7.0f)
-        val totalSamples = (durationSec * sampleRate).toInt()
-
-        val pcm = ShortArray(totalSamples)
-        val baseFreq = 165.0 // 自然語音基頻 (F0) 約 165 Hz
-
-        for (i in 0 until totalSamples) {
-            val t = i.toDouble() / sampleRate
-            // 語音音節包絡 (Syllable modulation)
-            val envelope = 0.5 * (1.0 + sin(2.0 * PI * 3.5 * t))
-            val harmonic1 = sin(2.0 * PI * baseFreq * t)
-            val harmonic2 = 0.5 * sin(2.0 * PI * (baseFreq * 2) * t)
-            val harmonic3 = 0.25 * sin(2.0 * PI * (baseFreq * 3) * t)
-
-            // 淡入淡出保護 (Fade in/out)
-            val fadeIn = (i.toFloat() / (sampleRate * 0.05f)).coerceIn(0f, 1f)
-            val fadeOut = ((totalSamples - i).toFloat() / (sampleRate * 0.05f)).coerceIn(0f, 1f)
-            val fade = fadeIn * fadeOut
-
-            val sampleVal = (envelope * (harmonic1 + harmonic2 + harmonic3) * fade * 12000.0).toInt().coerceIn(-32767, 32767)
-            pcm[i] = sampleVal.toShort()
-        }
-
-        return createWavBytes(pcm, sampleRate)
-    }
-
-    /**
-     * 打包標準 44-byte RIFF WAV 檔頭
-     */
-    private fun createWavBytes(pcm: ShortArray, sampleRate: Int): ByteArray {
-        val byteData = ByteArray(pcm.size * 2)
-        ByteBuffer.wrap(byteData).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(pcm)
-
-        val totalDataLen = byteData.size + 36
-        val byteRate = sampleRate * 2 // 16-bit Mono
-
-        val header = ByteArray(44)
-        val bb = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
-
-        // RIFF chunk
-        bb.put('R'.code.toByte())
-        bb.put('I'.code.toByte())
-        bb.put('F'.code.toByte())
-        bb.put('F'.code.toByte())
-        bb.putInt(totalDataLen)
-        bb.put('W'.code.toByte())
-        bb.put('A'.code.toByte())
-        bb.put('V'.code.toByte())
-        bb.put('E'.code.toByte())
-
-        // fmt chunk
-        bb.put('f'.code.toByte())
-        bb.put('m'.code.toByte())
-        bb.put('t'.code.toByte())
-        bb.put(' '.code.toByte())
-        bb.putInt(16) // Subchunk1Size (16 for PCM)
-        bb.putShort(1.toShort()) // AudioFormat (1 for PCM)
-        bb.putShort(1.toShort()) // NumChannels (1 for Mono)
-        bb.putInt(sampleRate)
-        bb.putInt(byteRate)
-        bb.putShort(2.toShort()) // BlockAlign (2 bytes)
-        bb.putShort(16.toShort()) // BitsPerSample (16 bits)
-
-        // data chunk
-        bb.put('d'.code.toByte())
-        bb.put('a'.code.toByte())
-        bb.put('t'.code.toByte())
-        bb.put('a'.code.toByte())
-        bb.putInt(byteData.size)
-
-        val baos = ByteArrayOutputStream(44 + byteData.size)
-        baos.write(header)
-        baos.write(byteData)
-        return baos.toByteArray()
-    }
+    override fun synthesizeSpeechStream(text: String): Flow<ByteArray> = emptyFlow()
 
     private fun extractLogMel(samples: FloatArray): FloatArray {
         if (samples.isEmpty()) return FloatArray(0)

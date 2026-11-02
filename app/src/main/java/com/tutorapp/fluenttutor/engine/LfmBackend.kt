@@ -32,6 +32,7 @@ class LfmRawResponse(
  */
 interface LfmBackend {
     suspend fun generate(request: LfmRequest): LfmRawResponse
+    fun generateInitialGreeting(scenario: Scenario): String = scenario.initialGreeting
     fun synthesizeSpeech(text: String): ByteArray? = null
     fun synthesizeSpeechStream(text: String): Flow<ByteArray> = emptyFlow()
     fun release()

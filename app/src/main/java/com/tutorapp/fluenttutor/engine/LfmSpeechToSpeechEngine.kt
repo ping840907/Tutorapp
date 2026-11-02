@@ -72,6 +72,8 @@ class LfmSpeechToSpeechEngine(
         )
     }
 
+    fun generateGreeting(scenario: Scenario): String = backend.generateInitialGreeting(scenario)
+
     fun synthesizeSpeech(text: String): ByteArray? = backend.synthesizeSpeech(text)
 
     fun synthesizeSpeechStream(text: String): Flow<ByteArray> = backend.synthesizeSpeechStream(text)

@@ -167,4 +167,31 @@ class LfmSpeechToSpeechEngineTest {
         assertEquals(4, chunkList.size)
         assertEquals(12000, chunkList[0].size)
     }
+
+    @Test
+    fun testDynamicGreetingGeneration() {
+        val scenario = Scenario.getPredefinedEnglishScenarios().first()
+        val fakeBackend = object : LfmBackend {
+            override suspend fun generate(request: LfmRequest): LfmRawResponse = LfmRawResponse("ok")
+            override fun generateInitialGreeting(scenario: Scenario): String {
+                return "Good morning! Welcome to Bean & Leaf. What can I get handcrafted for you today?"
+            }
+            override fun release() {}
+        }
+        val engine = LfmSpeechToSpeechEngine(fakeBackend)
+        val greeting = engine.generateGreeting(scenario)
+        assertTrue(greeting.isNotBlank())
+        assertTrue(greeting.contains("Bean & Leaf"))
+    }
+
+    @Test
+    fun testSpeechSynthesisNullWhenNoCodecGenerated() {
+        val fakeBackend = object : LfmBackend {
+            override suspend fun generate(request: LfmRequest): LfmRawResponse = LfmRawResponse("ok")
+            override fun synthesizeSpeech(text: String): ByteArray? = null
+            override fun release() {}
+        }
+        val engine = LfmSpeechToSpeechEngine(fakeBackend)
+        assertNull(engine.synthesizeSpeech("Any speech text"))
+    }
 }
