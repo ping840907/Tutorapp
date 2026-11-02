@@ -8,6 +8,7 @@ import com.tutorapp.fluenttutor.audio.AudioPlayer
 import com.tutorapp.fluenttutor.audio.AudioRecorder
 import com.tutorapp.fluenttutor.engine.LfmAudioClient
 import com.tutorapp.fluenttutor.engine.MissionJudgeEngine
+import com.tutorapp.fluenttutor.engine.ondevice.OnDeviceLfmEngine
 import com.tutorapp.fluenttutor.model.ChatMessage
 import com.tutorapp.fluenttutor.model.Language
 import com.tutorapp.fluenttutor.model.MessageSender
@@ -22,6 +23,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+enum class InferenceEngineMode(val displayName: String, val badge: String) {
+    ON_DEVICE_LOCAL("手機本機推論 (On-Device Local)", "📱 Local Edge"),
+    SMART_SIMULATOR("智慧情境模擬 (Simulator)", "⚡ Fast Sim"),
+    REMOTE_SERVER("外部推論伺服器 (Remote GPU)", "🌐 Cloud/LAN")
+}
+
 data class TutorUiState(
     val currentScenario: Scenario,
     val goals: List<MissionGoal>,
@@ -34,8 +41,10 @@ data class TutorUiState(
     val offTopicStrikes: Int = 0,
     val missionStatus: MissionStatus = MissionStatus.IN_PROGRESS,
     val finalSummary: MissionFinalSummary? = null,
-    val isConnectingLfm: Boolean = false,
-    val isMockMode: Boolean = true,
+    val isProcessing: Boolean = false,
+    val inferenceMode: InferenceEngineMode = InferenceEngineMode.ON_DEVICE_LOCAL,
+    val onDeviceRamMb: Long = 0L,
+    val lastLatencyMs: Long = 0L,
     val lfmServerUrl: String = "",
     val availableScenarios: List<Scenario> = Scenario.getPredefinedScenarios(),
     val selectedLanguage: Language = Language.ENGLISH
@@ -60,6 +69,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<TutorUiState> = _uiState.asStateFlow()
 
     private val lfmClient = LfmAudioClient()
+    private val onDeviceEngine = OnDeviceLfmEngine(application)
     private val judgeEngine = MissionJudgeEngine()
     private val evaluations = mutableListOf<TurnEvaluation>()
 
@@ -83,6 +93,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     init {
+        onDeviceEngine.loadLocalModel()
         initScenario(initialScenario)
     }
 
@@ -112,7 +123,8 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 isAiSpeaking = false,
                 offTopicStrikes = 0,
                 missionStatus = MissionStatus.IN_PROGRESS,
-                finalSummary = null
+                finalSummary = null,
+                onDeviceRamMb = onDeviceEngine.getMemoryUsageMb()
             )
         }
 
@@ -128,6 +140,10 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         val newScenario = filtered.firstOrNull() ?: allScenarios.first()
         _uiState.update { it.copy(selectedLanguage = language) }
         initScenario(newScenario)
+    }
+
+    fun setInferenceMode(mode: InferenceEngineMode) {
+        _uiState.update { it.copy(inferenceMode = mode) }
     }
 
     fun toggleRecording() {
@@ -160,20 +176,48 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         val turnIndex = evaluations.size
 
         viewModelScope.launch {
-            _uiState.update { it.copy(isConnectingLfm = true) }
+            _uiState.update { it.copy(isProcessing = true) }
 
-            // 1. 調用 LFM3-Audio 模型推論 (或端側 Smart Simulator)
-            val response = lfmClient.sendAudioSegment(
-                pcmData = pcmData,
-                durationMs = durationMs,
-                scenario = currentScenario,
-                turnIndex = turnIndex,
-                simulatedTextInput = manualText
-            )
+            val replyText: String
+            val recognizedUserText: String
+            val generatedAudioBytes: ByteArray?
+            val latency: Long
 
-            // 2. 評判小模型評估此輪對話
+            when (_uiState.value.inferenceMode) {
+                InferenceEngineMode.ON_DEVICE_LOCAL -> {
+                    // 🌟 100% 手機本機端側離線推論與語音生成 🌟
+                    val onDeviceRes = onDeviceEngine.inferAndGenerateSpeech(
+                        pcmData = pcmData,
+                        durationMs = durationMs,
+                        scenario = currentScenario,
+                        turnIndex = turnIndex,
+                        manualText = manualText
+                    )
+                    replyText = onDeviceRes.replyText
+                    recognizedUserText = onDeviceRes.recognizedUserText
+                    generatedAudioBytes = onDeviceRes.generatedAudioBytes
+                    latency = onDeviceRes.latencyMs
+                    _uiState.update { it.copy(onDeviceRamMb = onDeviceRes.usedRamMb) }
+                }
+                InferenceEngineMode.SMART_SIMULATOR -> {
+                    val simRes = lfmClient.sendAudioSegment(pcmData, durationMs, currentScenario, turnIndex, manualText)
+                    replyText = simRes.replyText
+                    recognizedUserText = simRes.recognizedUserText
+                    generatedAudioBytes = null
+                    latency = simRes.latencyMs
+                }
+                InferenceEngineMode.REMOTE_SERVER -> {
+                    val remoteRes = lfmClient.sendAudioSegment(pcmData, durationMs, currentScenario, turnIndex, manualText)
+                    replyText = remoteRes.replyText
+                    recognizedUserText = remoteRes.recognizedUserText
+                    generatedAudioBytes = remoteRes.audioBytes
+                    latency = remoteRes.latencyMs
+                }
+            }
+
+            // 評判小模型評估此輪對話
             val evaluation = judgeEngine.evaluateTurn(
-                userInput = response.recognizedUserText,
+                userInput = recognizedUserText,
                 currentGoals = currentGoals,
                 scenario = currentScenario,
                 turnIndex = turnIndex,
@@ -181,7 +225,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
             )
             evaluations.add(evaluation)
 
-            // 3. 更新目標清單
+            // 更新目標清單
             val updatedGoals = currentGoals.map { goal ->
                 if (evaluation.completedGoalIds.contains(goal.id)) {
                     goal.copy(isCompleted = true)
@@ -190,14 +234,14 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            // 4. 更新偏離 Strike
+            // 更新偏離 Strike
             val newStrikes = if (evaluation.isOffTopic) {
                 _uiState.value.offTopicStrikes + 1
             } else {
                 _uiState.value.offTopicStrikes
             }
 
-            // 5. 判定任務狀態 (PASSED / FAILED / IN_PROGRESS)
+            // 判定任務狀態 (PASSED / FAILED / IN_PROGRESS)
             val newStatus = judgeEngine.checkMissionStatus(
                 goals = updatedGoals,
                 offTopicStrikes = newStrikes,
@@ -205,7 +249,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 scenario = currentScenario
             )
 
-            // 6. 若任務完成或失敗，產生最終結算報告
+            // 若任務完成或失敗，產生最終結算報告
             val summary = if (newStatus != MissionStatus.IN_PROGRESS) {
                 audioRecorder.stopRecording()
                 judgeEngine.generateFinalSummary(
@@ -217,10 +261,10 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 )
             } else null
 
-            // 7. 更新 UI 訊息佇列
+            // 更新 UI 訊息佇列
             val userMsg = ChatMessage(
                 sender = MessageSender.USER,
-                text = response.recognizedUserText,
+                text = recognizedUserText,
                 audioDurationMs = durationMs,
                 isOffTopic = evaluation.isOffTopic,
                 offTopicReason = if (evaluation.isOffTopic) "Off-topic strike ($newStrikes/${currentScenario.maxOffTopicStrikes})" else null
@@ -228,7 +272,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
 
             val aiMsg = ChatMessage(
                 sender = MessageSender.TUTOR,
-                text = response.replyText
+                text = replyText
             )
 
             val updatedMessages = _uiState.value.messages.toMutableList().apply {
@@ -249,16 +293,17 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                     offTopicStrikes = newStrikes,
                     missionStatus = newStatus,
                     finalSummary = summary,
-                    isConnectingLfm = false,
+                    isProcessing = false,
+                    lastLatencyMs = latency,
                     isRecording = if (newStatus != MissionStatus.IN_PROGRESS) false else it.isRecording
                 )
             }
 
-            // 8. 播放 AI 回應語音
-            if (response.audioBytes != null && response.audioBytes.isNotEmpty()) {
-                audioPlayer.playPcm(response.audioBytes)
+            // 播放生成的語音
+            if (generatedAudioBytes != null && generatedAudioBytes.isNotEmpty()) {
+                audioPlayer.playPcm(generatedAudioBytes)
             } else {
-                audioPlayer.speakText(response.replyText)
+                audioPlayer.speakText(replyText)
             }
         }
     }
@@ -283,14 +328,13 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(finalSummary = null) }
     }
 
-    fun updateServerConfig(url: String, apiKey: String, mockMode: Boolean) {
+    fun updateServerConfig(url: String, apiKey: String, mode: InferenceEngineMode) {
         lfmClient.serverUrl = url
         lfmClient.apiKey = apiKey
-        lfmClient.isMockMode = mockMode
         _uiState.update {
             it.copy(
                 lfmServerUrl = url,
-                isMockMode = mockMode
+                inferenceMode = mode
             )
         }
     }
@@ -299,5 +343,6 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
         audioRecorder.stopRecording()
         audioPlayer.release()
+        onDeviceEngine.release()
     }
 }

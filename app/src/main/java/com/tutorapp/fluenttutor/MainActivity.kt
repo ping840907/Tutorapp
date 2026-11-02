@@ -121,9 +121,9 @@ class MainActivity : ComponentActivity() {
                         AppScreen.SETTINGS -> {
                             SettingsScreen(
                                 currentServerUrl = uiState.lfmServerUrl,
-                                isMockMode = uiState.isMockMode,
-                                onSaveConfig = { url, apiKey, mockMode ->
-                                    viewModel.updateServerConfig(url, apiKey, mockMode)
+                                currentMode = uiState.inferenceMode,
+                                onSaveConfig = { url, apiKey, mode ->
+                                    viewModel.updateServerConfig(url, apiKey, mode)
                                 },
                                 onBack = {
                                     currentScreen = AppScreen.SCENARIO_SELECT

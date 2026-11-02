@@ -78,9 +78,9 @@ fun ConversationScreen(
                             color = TextPrimary
                         )
                         Text(
-                            text = if (uiState.isMockMode) "⚡ Smart Simulator (Edge Mode)" else "🌐 LFM3-Audio Connected",
+                            text = "${uiState.inferenceMode.badge} • ${if (uiState.lastLatencyMs > 0) "${uiState.lastLatencyMs}ms" else "Ready"} • RAM ${uiState.onDeviceRamMb}MB",
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (uiState.isMockMode) PrimaryBlue else Color(0xFF22C55E)
+                            color = PrimaryBlue
                         )
                     }
                 },
@@ -157,7 +157,7 @@ fun ConversationScreen(
             }
 
             // 推論中 Loading 指示器
-            if (uiState.isConnectingLfm) {
+            if (uiState.isProcessing) {
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -175,7 +175,9 @@ fun ConversationScreen(
                             modifier = Modifier.padding(end = 8.dp).height(16.dp).fillMaxWidth(0.1f)
                         )
                         Text(
-                            text = "LFM3 Audio Processing...",
+                            text = if (uiState.inferenceMode == com.tutorapp.fluenttutor.ui.viewmodel.InferenceEngineMode.ON_DEVICE_LOCAL)
+                                "手機本機端側 LFM3 語音推論中..."
+                            else "LFM3 Audio Processing...",
                             fontSize = 11.sp,
                             color = PrimaryBlue
                         )

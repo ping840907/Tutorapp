@@ -66,8 +66,8 @@ fun WaveformBar(
                 val normalizedIndex = i.toFloat() / barCount
                 // 波動計算
                 val waveFactor = if (isSpeaking) {
-                    val sine = (sin((phase + normalizedIndex * 4.0).toDouble()) + 1.0) / 2.0
-                    (sine * 0.7f + amplitude * 1.5f).coerceIn(0.15f, 1.0f).toFloat()
+                    val sine = ((sin((phase + normalizedIndex * 4f).toDouble()) + 1.0) / 2.0).toFloat()
+                    (sine * 0.7f + amplitude * 1.5f).coerceIn(0.15f, 1.0f)
                 } else {
                     0.08f + (amplitude * 0.5f)
                 }

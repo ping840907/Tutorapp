@@ -78,7 +78,7 @@ fun MissionResultDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(24.dp),
-                horizontalAlignment = Alignment.CenterCenterHorizontally
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 // 狀態圖標圓圈
                 Box(

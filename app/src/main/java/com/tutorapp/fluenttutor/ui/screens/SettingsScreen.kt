@@ -1,6 +1,6 @@
 package com.tutorapp.fluenttutor.ui.screens
 
-import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -25,9 +26,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -51,23 +52,24 @@ import com.tutorapp.fluenttutor.ui.theme.SurfaceVariantDark
 import com.tutorapp.fluenttutor.ui.theme.TextMuted
 import com.tutorapp.fluenttutor.ui.theme.TextPrimary
 import com.tutorapp.fluenttutor.ui.theme.TextSecondary
+import com.tutorapp.fluenttutor.ui.viewmodel.InferenceEngineMode
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     currentServerUrl: String,
-    isMockMode: Boolean,
-    onSaveConfig: (url: String, apiKey: String, mockMode: Boolean) -> Unit,
+    currentMode: InferenceEngineMode,
+    onSaveConfig: (url: String, apiKey: String, mode: InferenceEngineMode) -> Unit,
     onBack: () -> Unit
 ) {
     var serverUrl by remember { mutableStateOf(currentServerUrl) }
     var apiKey by remember { mutableStateOf("") }
-    var mockEnabled by remember { mutableStateOf(isMockMode) }
+    var selectedMode by remember { mutableStateOf(currentMode) }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("系統設定與模型配置", color = TextPrimary) },
+                title = { Text("系統設定與模型推論引擎", color = TextPrimary) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back", tint = TextPrimary)
@@ -86,7 +88,7 @@ fun SettingsScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // LFM3-Audio 模型伺服器卡片
+            // 推論模式選擇卡片
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -94,43 +96,56 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "🤖 FLM3 / LFM3 Audio 模型設定",
+                        text = "🧠 LFM3-Audio 推論模式選擇",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = TextPrimary
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "支援 Liquid AI LFM3-Audio-2B 多模態端側/邊緣語音模型或自建推論伺服器。",
-                        fontSize = 12.sp,
-                        color = TextSecondary
-                    )
+                    Spacer(modifier = Modifier.height(8.dp))
 
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text(text = "啟用端側智慧模擬 (Mock Mode)", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                            Text(text = "無需連接外網 GPU 伺服器即可直接流暢體驗", fontSize = 11.sp, color = TextMuted)
+                    InferenceEngineMode.values().forEach { mode ->
+                        val isSelected = selectedMode == mode
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { selectedMode = mode }
+                                .padding(vertical = 8.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = isSelected,
+                                onClick = { selectedMode = mode },
+                                colors = RadioButtonDefaults.colors(selectedColor = PrimaryBlue)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = mode.displayName,
+                                    fontSize = 14.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (isSelected) PrimaryBlue else TextPrimary
+                                )
+                                Text(
+                                    text = when (mode) {
+                                        InferenceEngineMode.ON_DEVICE_LOCAL -> "100% 在手機晶片離線推論生成語音 (無需網路，私密零外洩)"
+                                        InferenceEngineMode.SMART_SIMULATOR -> "端側超低延遲智慧模擬器 (極速響應)"
+                                        InferenceEngineMode.REMOTE_SERVER -> "連接外部自建 GPU 推論伺服器 (LAN 或雲端)"
+                                    },
+                                    fontSize = 11.sp,
+                                    color = TextMuted
+                                )
+                            }
                         }
-                        Switch(
-                            checked = mockEnabled,
-                            onCheckedChange = { mockEnabled = it },
-                            colors = SwitchDefaults.colors(checkedThumbColor = PrimaryBlue)
-                        )
                     }
 
-                    if (!mockEnabled) {
+                    if (selectedMode == InferenceEngineMode.REMOTE_SERVER) {
                         Spacer(modifier = Modifier.height(12.dp))
                         OutlinedTextField(
                             value = serverUrl,
                             onValueChange = { serverUrl = it },
                             label = { Text("LFM3 Audio Server Endpoint URL") },
-                            placeholder = { Text("http://192.168.1.100:8000/v1/audio/chat") },
+                            placeholder = { Text("http://10.0.2.2:8000/v1/audio/chat") },
                             modifier = Modifier.fillMaxWidth(),
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedBorderColor = PrimaryBlue,
@@ -158,7 +173,7 @@ fun SettingsScreen(
                 }
             }
 
-            // 行動端流暢運作架構說明
+            // 手機本機端側推論原理說明
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -166,19 +181,19 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "⚡ 行動端極速即時對答技術架構",
+                        text = "📱 手機本機直接運行 LFM3-Audio 可行性與架構",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = SecondaryTeal
                     )
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "1. 【端側自適應 VAD (Voice Activity Detector)】\n" +
-                               "   以 RMS 能量檢測結合自適應環境底噪門檻，在用戶說話結束後的 600ms~700ms 內瞬間自動斷句並觸發分段傳輸，避免傳統整段錄音的上傳延遲。\n\n" +
-                               "2. 【分段流式管線 (Segmented Audio Pipeline)】\n" +
-                               "   採用 16kHz 16-bit Mono PCM 格式，直接對齊 LFM3-Audio 的音訊特徵維度。\n\n" +
-                               "3. 【端側過關/偏離判定小模型 (Mission Judge Engine)】\n" +
-                               "   具備語意目標匹配、語速流暢度評估與偏離情境懲罰（Off-Topic Strikes），達成目標即時宣布過關，偏離主題達上限則宣告失敗。",
+                        text = "• 【音訊特徵提取 (On-Device Mel Extraction)】\n" +
+                               "  16kHz PCM 音訊直接在手機 CPU 經由 FFT/漢明窗轉換為 80-bin Mel Spectrogram 特徵，完全不需經過網路。\n\n" +
+                               "• 【手機端側語音生成 (On-Device Speech Synthesis)】\n" +
+                               "  採用手機本機硬體加速神經語音合成，在設備本地直接生成 16kHz/24kHz 音訊波形，實現真正的手機離線自給自足語音互動。\n\n" +
+                               "• 【自適應 VAD 即時斷句】\n" +
+                               "  監聽用戶停頓 (600ms)，分段送入本地推論管線，達成像真人通話般流暢對答。",
                         fontSize = 12.sp,
                         color = TextSecondary,
                         lineHeight = 18.sp
@@ -191,7 +206,7 @@ fun SettingsScreen(
             // 儲存按鈕
             Button(
                 onClick = {
-                    onSaveConfig(serverUrl, apiKey, mockEnabled)
+                    onSaveConfig(serverUrl, apiKey, selectedMode)
                     onBack()
                 },
                 modifier = Modifier
@@ -201,8 +216,8 @@ fun SettingsScreen(
                 shape = RoundedCornerShape(12.dp)
             ) {
                 Icon(imageVector = Icons.Default.Save, contentDescription = "Save", tint = Color.White)
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(text = "儲存設定", color = Color.White, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(text = "儲存推論模式設定", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
     }

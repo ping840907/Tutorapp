@@ -1,0 +1,11 @@
+fastapi>=0.110.0
+uvicorn>=0.28.0
+numpy>=1.24.0
+soundfile>=0.12.1
+pydantic>=2.0.0
+requests>=2.31.0
+python-multipart>=0.0.9
+# PyTorch and Model dependencies (Install CPU or CUDA version as needed)
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.28.0
