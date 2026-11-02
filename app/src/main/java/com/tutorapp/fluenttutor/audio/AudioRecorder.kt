@@ -41,8 +41,11 @@ class AudioRecorder(
     private var preRollHead = 0
     private var preRollFilled = 0
 
+    @Volatile
     private var isRecording = false
+    @Volatile
     private var isAutoSegmentEnabled = true
+    @Volatile
     private var isHalfDuplexMuted = false // 當 AI 播放語音時為 true，阻斷麥克風自激
 
     fun setAutoSegmentEnabled(enabled: Boolean) {
@@ -112,7 +115,7 @@ class AudioRecorder(
                     if (readCount > 0) {
                         // 若處於半雙工靜音狀態 (AI 正在發言)，直接丟棄避免回音
                         if (isHalfDuplexMuted) {
-                            onAmplitudeChanged(0.05f)
+                            onAmplitudeChanged(0.02f)
                             continue
                         }
 
@@ -125,7 +128,16 @@ class AudioRecorder(
                         ByteBuffer.wrap(byteBuffer).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(shortBuffer, 0, readCount)
                         val bytesLength = readCount * 2
 
-                        // VAD 斷句狀態推進
+                        // 若關閉自動 VAD，則在錄音期間持續累積音訊，等使用者手動停止或點擊送出時切片
+                        if (!isAutoSegmentEnabled) {
+                            onSpeechStatusChanged(normalizedAmp > 0.15f)
+                            synchronized(speechBuffer) {
+                                speechBuffer.write(byteBuffer, 0, bytesLength)
+                            }
+                            continue
+                        }
+
+                        // 自動 VAD 斷句狀態推進
                         when (val vadRes = vad.processFrame(rms, readCount)) {
                             is VoiceActivityDetector.VadResult.SpeechStarted -> {
                                 onSpeechStatusChanged(true)
@@ -147,9 +159,7 @@ class AudioRecorder(
                                 synchronized(speechBuffer) {
                                     speechBuffer.write(byteBuffer, 0, bytesLength)
                                 }
-                                if (isAutoSegmentEnabled) {
-                                    flushSegment(vadRes.speechDurationMs)
-                                }
+                                flushSegment(vadRes.speechDurationMs)
                             }
                             is VoiceActivityDetector.VadResult.None -> {
                                 synchronized(speechBuffer) {
@@ -169,7 +179,7 @@ class AudioRecorder(
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Error starting AudioRecord", e)
-            stopRecording()
+            stopRecording(flushRemaining = false)
             return false
         }
     }
@@ -207,10 +217,16 @@ class AudioRecorder(
         preRollFilled = 0
     }
 
-    fun stopRecording() {
+    fun stopRecording(flushRemaining: Boolean = false) {
+        val wasRecording = isRecording
         isRecording = false
         recordingJob?.cancel()
         recordingJob = null
+        if (wasRecording && flushRemaining) {
+            flushSegment()
+        } else {
+            synchronized(speechBuffer) { speechBuffer.reset() }
+        }
         try {
             audioRecord?.stop()
             audioRecord?.release()

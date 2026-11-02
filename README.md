@@ -29,13 +29,23 @@
   - 音訊錄音來源改用 `MediaRecorder.AudioSource.VOICE_COMMUNICATION`，自動啟用高通晶片硬體級 `AcousticEchoCanceler` (AEC) 與 `NoiseSuppressor`。
   - 增加半雙工閘控：當 AI 在播放語音時，錄音管線自動靜音（Mute），播放結束後恢復，阻斷麥克風自激。
 
-### 4. 解決雜音爆音與音訊播放取樣率混淆
-- 打造專屬 `AudioPlayer`，具備 **智慧 WAV 標頭解析器**（動態識別 16kHz / 22.05kHz / 24kHz / 48kHz 取樣率與聲道），跳過 44-byte RIFF 標頭，杜絕將標頭當作 PCM 播放造成的爆音。
+### 4. 即時動態 NPC 動畫頭像系統 (Animated NPC Avatar & Real-time Lip-Sync)
+- **專屬角色造型 (`NpcAvatarStyle`)**：
+  - ☕ **Sarah (`BARISTA_SARAH`)**：溫暖翡翠綠圍裙咖啡師（丸子頭、微笑酒窩）。
+  - 🏨 **David (`CONCIERGE_DAVID`)**：Grand Hyatt 皇家藍西裝禮賓經理（金色領帶與徽章）。
+  - ✈️ **Elena (`AGENT_ELENA`)**：甘迺迪機場深藍制服地勤專員（桃紅絲巾與耳機麥克風）。
+- **5 種互動狀態機 (`NpcInteractionState`)**：
+  - `IDLE`（自然呼吸起伏與隨機單/雙次眨眼）、`LISTENING_IDLE`（微微前傾專注傾聽）、`LISTENING_ACTIVE`（隨用戶音量點頭與雙層光圈脈衝）、`THINKING`（視線朝右上凝視、歪頭思考與動態思考氣泡）、`SPEAKING`（由 `AudioPlayer` 播放 PCM RMS 即時振幅驅動的精準嘴型開合 Lip-Sync 與音節律動）。
+- **5 種情緒表情回饋 (`NpcEmotion`)**：
+  - `WELCOMING`（友善迎賓微笑）、`HAPPY_ENCOURAGING`（回答切題時的鼓勵笑容）、`EXCITED_PROUD`（達成子目標或過關時的彎月笑眼 `^ ^`、紅潤雙頰與閃爍星芒）、`CONFUSED_WARNING`（偏離主題 Strike 時的高低挑眉與問號警示）、`DISAPPOINTED_FAILED`（任務失敗時的八字垂眉與失落表情）。
 
-### 5. 單線程序列化佇列 (Sequential Channel Pipeline)
+### 5. 解決雜音爆音、RIFF Chunk 動態解析與語音播放同步
+- 打造專屬 `AudioPlayer`，具備 **動態 RIFF Chunk 標頭掃描器**（精準定位 `"fmt "` 與 `"data"` 區段，避免 Android 合成 WAV 含額外 `LIST` chunk 時因固定 44-byte 偏移造成的爆音），並透過 `MODE_STREAM` 分塊寫入即時計算播放振幅。
+
+### 6. 單線程序列化佇列 (Sequential Channel Pipeline)
 - 透過 Kotlin `Channel` 確保每一段語音依序排隊處理，杜絕多段語音並發造成的變數覆蓋與目標狀態競爭條件 (Race Condition)。
 
-### 6. 專注深度打磨英語對話任務 (English Focused)
+### 7. 專注深度打磨英語對話任務 (English Focused)
 - 移除日語過渡程式碼與多餘的 server/ 後端腳本，架構純粹簡潔：
   - **Scenario 1: Coffee Shop Order**（紐約 Bean & Leaf 咖啡廳點燕麥奶拿鐵）
   - **Scenario 2: Hotel Front Desk**（Grand Hyatt 櫃檯辦理入住手續與詢問設施）
@@ -55,16 +65,19 @@ com.tutorapp.fluenttutor
 │   ├── LfmSpeechToSpeechEngine.kt # 主引擎：SM8850 S2S 語音流對話與波形合成
 │   └── MissionJudgeEngine.kt      # 副引擎：防幻覺目標達成狀態機與偏離懲罰審查
 ├── model/
-│   ├── Scenario.kt               # 精選英語任務場景
+│   ├── Scenario.kt               # 精選英語任務場景與專屬 NPC 角色設定
+│   ├── NpcAvatarModels.kt        # NPC 造型、互動狀態與情緒表情狀態機定義
 │   ├── MissionGoal.kt            # 順序約束與否定排除之目標模型
 │   ├── ChatMessage.kt            # 對話實體
 │   └── EvaluationResult.kt       # 成績單與星級評分
 └── ui/
     ├── screens/
     │   ├── ScenarioSelectScreen.kt # 關卡任務選擇
-    │   └── ConversationScreen.kt   # 雙引擎即時語音對答主畫面
-    ├── components/                 # 聲波視覺化、目標進度卡、結算彈窗
-    ├── viewmodel/TutorViewModel.kt # 單線程序列化協程處理狀態機
+    │   └── ConversationScreen.kt   # 雙引擎即時語音對答與動態 NPC 主畫面
+    ├── components/
+    │   ├── NpcAvatarCard.kt        # 即時動態向量 NPC 頭像 (Lip-Sync / 表情 / 眨眼)
+    │   └── ...                     # 聲波視覺化、目標進度卡、結算彈窗
+    ├── viewmodel/TutorViewModel.kt # 單線程序列化協程處理與 NPC 情緒狀態機
     └── MainActivity.kt             # 生命週期保護 (退後台停收音) 與動態權限
 ```
 

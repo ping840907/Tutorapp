@@ -6,8 +6,10 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import com.tutorapp.fluenttutor.model.Scenario
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.Locale
 import java.util.UUID
@@ -34,6 +36,7 @@ class LfmSpeechToSpeechEngine(private val context: Context) : TextToSpeech.OnIni
     }
 
     private var tts: TextToSpeech? = null
+    @Volatile
     private var isTtsReady = false
 
     // 漢明窗 (Hamming Window) 預計算
@@ -86,7 +89,8 @@ class LfmSpeechToSpeechEngine(private val context: Context) : TextToSpeech.OnIni
         for (i in 0 until shortsCount) {
             val low = pcmBytes[i * 2].toInt() and 0xFF
             val high = pcmBytes[i * 2 + 1].toInt()
-            floatSamples[i] = ((high shl 8) or low) / 32768.0f
+            val signedSample = ((high shl 8) or low).toShort()
+            floatSamples[i] = signedSample / 32768.0f
         }
 
         val numFrames = (shortsCount - FFT_SIZE) / HOP_LENGTH + 1
@@ -187,7 +191,7 @@ class LfmSpeechToSpeechEngine(private val context: Context) : TextToSpeech.OnIni
     }
 
     /**
-     * 生成情境對話回覆 (具備多輪狀態記憶)
+     * 生成情境對話回覆 (具備多輪狀態記憶與離題引導)
      */
     private fun generateContextualReply(
         userInput: String,
@@ -197,9 +201,16 @@ class LfmSpeechToSpeechEngine(private val context: Context) : TextToSpeech.OnIni
     ): String {
         val input = userInput.lowercase()
 
+        // 若用戶明顯偏離話題，NPC 以困惑語氣引導回正題
+        val isUnrelated = Regex("\\b(minecraft|fortnite|playstation|xbox|video\\s*game|alien|ufo|politics|president|homework)\\b", RegexOption.IGNORE_CASE)
+            .containsMatchIn(input)
+
         return when (scenario.id) {
             "cafe_latte_en" -> {
                 when {
+                    isUnrelated -> {
+                        "Hmm, I'm a little confused! We're at Bean & Leaf coffee shop—could you let me know what drink you'd like to order?"
+                    }
                     input.contains("latte") && (input.contains("oat") || input.contains("milk")) -> {
                         "Got it, one oat milk latte! Would you prefer that hot or iced, and what size: small, medium, or large?"
                     }
@@ -216,6 +227,9 @@ class LfmSpeechToSpeechEngine(private val context: Context) : TextToSpeech.OnIni
             }
             "hotel_checkin_en" -> {
                 when {
+                    isUnrelated -> {
+                        "Pardon me? I'm at the Grand Hyatt front desk—may I help you with your room check-in or hotel amenities?"
+                    }
                     input.contains("check in") || input.contains("reservation") || input.contains("booking") -> {
                         "Welcome to Grand Hyatt! I found your reservation. Here is your keycard for Room 704. Any questions regarding the hotel amenities?"
                     }
@@ -232,6 +246,9 @@ class LfmSpeechToSpeechEngine(private val context: Context) : TextToSpeech.OnIni
             }
             "airport_checkin_en" -> {
                 when {
+                    isUnrelated -> {
+                        "Excuse me, we are boarding soon at the Delta gate—could I see your passport or help with your seat assignment?"
+                    }
                     input.contains("flight") || input.contains("passport") || input.contains("ticket") -> {
                         "Thank you, passport confirmed. Do you have any checked bags today, and do you have a preference for window or aisle seating?"
                     }
@@ -251,37 +268,41 @@ class LfmSpeechToSpeechEngine(private val context: Context) : TextToSpeech.OnIni
     }
 
     /**
-     * 端側語音波形合成
+     * 端側語音波形合成 (使用執行緒安全的 CompletableDeferred 等待合成完畢，並確保暫存檔清理)
      */
     private suspend fun synthesizeSpeechWaveform(text: String): ByteArray? = withContext(Dispatchers.IO) {
         if (!isTtsReady || tts == null) return@withContext null
 
         val tempWav = File(context.cacheDir, "s2s_${UUID.randomUUID()}.wav")
-        val uId = "synth_${System.currentTimeMillis()}"
-        var done = false
+        val uId = "synth_${System.nanoTime()}"
+        val deferred = CompletableDeferred<Boolean>()
 
-        val listener = object : UtteranceProgressListener() {
-            override fun onStart(id: String?) {}
-            override fun onDone(id: String?) { if (id == uId) done = true }
-            @Deprecated("Deprecated in Java")
-            override fun onError(id: String?) { if (id == uId) done = true }
-        }
-        tts?.setOnUtteranceProgressListener(listener)
-
-        val result = tts?.synthesizeToFile(text, null, tempWav, uId)
-        if (result == TextToSpeech.SUCCESS) {
-            var checks = 0
-            while (!done && checks < 40) {
-                kotlinx.coroutines.delay(25)
-                checks++
+        try {
+            val listener = object : UtteranceProgressListener() {
+                override fun onStart(id: String?) {}
+                override fun onDone(id: String?) {
+                    if (id == uId) deferred.complete(true)
+                }
+                @Deprecated("Deprecated in Java")
+                override fun onError(id: String?) {
+                    if (id == uId) deferred.complete(false)
+                }
             }
-            if (tempWav.exists() && tempWav.length() > 0) {
-                val bytes = tempWav.readBytes()
+            tts?.setOnUtteranceProgressListener(listener)
+
+            val result = tts?.synthesizeToFile(text, null, tempWav, uId)
+            if (result == TextToSpeech.SUCCESS) {
+                val success = withTimeoutOrNull(4000L) { deferred.await() } ?: false
+                if (success && tempWav.exists() && tempWav.length() > 44L) {
+                    return@withContext tempWav.readBytes()
+                }
+            }
+            return@withContext null
+        } finally {
+            if (tempWav.exists()) {
                 tempWav.delete()
-                return@withContext bytes
             }
         }
-        return@withContext null
     }
 
     fun release() {

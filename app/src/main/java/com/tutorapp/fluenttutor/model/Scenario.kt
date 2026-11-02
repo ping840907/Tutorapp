@@ -6,6 +6,7 @@ data class Scenario(
     val subtitle: String,
     val description: String,
     val roleName: String,
+    val avatarStyle: NpcAvatarStyle = NpcAvatarStyle.BARISTA_SARAH,
     val systemPrompt: String,
     val initialGreeting: String,
     val goals: List<MissionGoal>,
@@ -21,6 +22,7 @@ data class Scenario(
                 subtitle = "Order an iced oat milk latte",
                 description = "You're at Bean & Leaf in New York. Order an oat milk latte, select iced/medium, and pay by card.",
                 roleName = "Sarah (Barista)",
+                avatarStyle = NpcAvatarStyle.BARISTA_SARAH,
                 systemPrompt = """
                     You are Sarah, a warm and efficient barista at Bean & Leaf cafe in Manhattan.
                     Speak naturally in concise spoken English (1-2 sentences).
@@ -71,6 +73,7 @@ data class Scenario(
                 subtitle = "Check in and ask for breakfast & Wi-Fi",
                 description = "Check in with your reservation, ask about breakfast time and Wi-Fi password at Grand Hyatt.",
                 roleName = "David (Concierge)",
+                avatarStyle = NpcAvatarStyle.CONCIERGE_DAVID,
                 systemPrompt = """
                     You are David, the concierge at Grand Hyatt. Polite, clear, and professional.
                     Acknowledge the reservation, provide room key info, and answer guest questions.
@@ -117,6 +120,7 @@ data class Scenario(
                 subtitle = "Check in luggage & request seat preference",
                 description = "At JFK terminal. Check in for your flight, state seat preference (window/aisle), and ask for gate number.",
                 roleName = "Elena (Airline Agent)",
+                avatarStyle = NpcAvatarStyle.AGENT_ELENA,
                 systemPrompt = """
                     You are Elena, a customer service agent for Delta Air Lines at JFK airport.
                     Keep sentences concise, professional, and friendly.

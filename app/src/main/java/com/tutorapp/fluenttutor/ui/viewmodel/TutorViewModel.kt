@@ -1,7 +1,6 @@
 package com.tutorapp.fluenttutor.ui.viewmodel
 
 import android.app.Application
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.tutorapp.fluenttutor.audio.AudioPlayer
@@ -13,6 +12,8 @@ import com.tutorapp.fluenttutor.model.MessageSender
 import com.tutorapp.fluenttutor.model.MissionFinalSummary
 import com.tutorapp.fluenttutor.model.MissionGoal
 import com.tutorapp.fluenttutor.model.MissionStatus
+import com.tutorapp.fluenttutor.model.NpcEmotion
+import com.tutorapp.fluenttutor.model.NpcInteractionState
 import com.tutorapp.fluenttutor.model.Scenario
 import com.tutorapp.fluenttutor.model.TurnEvaluation
 import kotlinx.coroutines.channels.Channel
@@ -30,21 +31,33 @@ data class TutorUiState(
     val isUserSpeaking: Boolean = false,
     val isAiSpeaking: Boolean = false,
     val amplitude: Float = 0f,
+    val aiAmplitude: Float = 0f,
     val isAutoVAD: Boolean = true,
     val offTopicStrikes: Int = 0,
     val missionStatus: MissionStatus = MissionStatus.IN_PROGRESS,
     val finalSummary: MissionFinalSummary? = null,
     val isProcessing: Boolean = false,
+    val npcEmotion: NpcEmotion = NpcEmotion.WELCOMING,
+    val lastEvaluationFeedback: String? = null,
+    val hasPlayedInitialGreeting: Boolean = false,
     val realRamMb: Long = 0L,
     val lastLatencyMs: Long = 0L,
     val availableScenarios: List<Scenario> = Scenario.getPredefinedEnglishScenarios()
-)
+) {
+    val npcInteractionState: NpcInteractionState
+        get() = when {
+            isAiSpeaking -> NpcInteractionState.SPEAKING
+            isProcessing -> NpcInteractionState.THINKING
+            isUserSpeaking -> NpcInteractionState.LISTENING_ACTIVE
+            isRecording -> NpcInteractionState.LISTENING_IDLE
+            else -> NpcInteractionState.IDLE
+        }
+
+    val activeAmplitude: Float
+        get() = if (isAiSpeaking) aiAmplitude else amplitude
+}
 
 class TutorViewModel(application: Application) : AndroidViewModel(application) {
-
-    companion object {
-        private const val TAG = "TutorViewModel"
-    }
 
     private data class QueuedAudioSegment(
         val pcmData: ByteArray,
@@ -72,13 +85,16 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     private val dialogHistory = mutableListOf<Pair<String, String>>()
     private val audioQueueChannel = Channel<QueuedAudioSegment>(Channel.UNLIMITED)
 
-    // 音訊播放器 (支援 WAV 標頭解析與半雙工保護)
+    // 音訊播放器 (支援 WAV 標頭解析、即時語音振幅同步與半雙工保護)
     private val audioPlayer = AudioPlayer(
         context = application,
         onPlaybackStateChanged = { isPlaying ->
             _uiState.update { it.copy(isAiSpeaking = isPlaying) }
             // 半雙工防回音：當 AI 播放語音時，麥克風自動阻斷自激
             audioRecorder.setHalfDuplexMuted(isPlaying)
+        },
+        onPlaybackAmplitudeChanged = { aiAmp ->
+            _uiState.update { it.copy(aiAmplitude = aiAmp) }
         }
     )
 
@@ -122,7 +138,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
      * 重設與切換場景 (靜態重設，不搶播語音)
      */
     fun prepareScenario(scenario: Scenario) {
-        audioRecorder.stopRecording()
+        audioRecorder.stopRecording(flushRemaining = false)
         audioPlayer.stop()
 
         evaluations.clear()
@@ -142,41 +158,45 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 isRecording = false,
                 isUserSpeaking = false,
                 isAiSpeaking = false,
+                amplitude = 0f,
+                aiAmplitude = 0f,
                 offTopicStrikes = 0,
                 missionStatus = MissionStatus.IN_PROGRESS,
                 finalSummary = null,
+                npcEmotion = NpcEmotion.WELCOMING,
+                lastEvaluationFeedback = "Task started: ${scenario.subtitle}",
+                hasPlayedInitialGreeting = false,
                 realRamMb = s2sEngine.getRealMemoryUsageMb()
             )
         }
     }
 
     /**
-     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語
+     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語 (具備防螢幕旋轉重複播放保護)
      */
     fun playGreetingOnScreenEnter() {
+        if (_uiState.value.hasPlayedInitialGreeting) return
+        _uiState.update { it.copy(hasPlayedInitialGreeting = true) }
         val greeting = _uiState.value.currentScenario.initialGreeting
         audioPlayer.speakText(greeting)
     }
 
     fun toggleRecording() {
         if (_uiState.value.isRecording) {
-            audioRecorder.stopRecording()
+            // 停止錄音時，若緩衝區有尚未送出的語音片段則一併送出 (支援手動關閉 VAD 模式)
+            audioRecorder.stopRecording(flushRemaining = true)
             _uiState.update { it.copy(isRecording = false) }
         } else {
             if (_uiState.value.missionStatus != MissionStatus.IN_PROGRESS) {
                 prepareScenario(_uiState.value.currentScenario)
             }
             val started = audioRecorder.startRecording(viewModelScope)
-            if (started) {
-                _uiState.update { it.copy(isRecording = true) }
-            } else {
-                _uiState.update { it.copy(isRecording = false) }
-            }
+            _uiState.update { it.copy(isRecording = started) }
         }
     }
 
     fun onPermissionDenied() {
-        audioRecorder.stopRecording()
+        audioRecorder.stopRecording(flushRemaining = false)
         _uiState.update { it.copy(isRecording = false) }
     }
 
@@ -246,9 +266,18 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
             scenario = scenario
         )
 
-        // 6. 若任務終止，結算成績單
+        // 6. 根據判定結果決定 NPC 的臉部表情與情緒狀態
+        val updatedEmotion = when {
+            newStatus == MissionStatus.PASSED -> NpcEmotion.EXCITED_PROUD
+            newStatus == MissionStatus.FAILED -> NpcEmotion.DISAPPOINTED_FAILED
+            evaluation.isOffTopic -> NpcEmotion.CONFUSED_WARNING
+            evaluation.completedGoalIds.isNotEmpty() -> NpcEmotion.EXCITED_PROUD
+            else -> NpcEmotion.HAPPY_ENCOURAGING
+        }
+
+        // 7. 若任務終止，結算成績單
         val summary = if (newStatus != MissionStatus.IN_PROGRESS) {
-            audioRecorder.stopRecording()
+            audioRecorder.stopRecording(flushRemaining = false)
             judgeEngine.generateFinalSummary(
                 status = newStatus,
                 goals = updatedGoals,
@@ -258,7 +287,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
             )
         } else null
 
-        // 7. 更新對話 UI
+        // 8. 更新對話 UI
         val userMsg = ChatMessage(
             sender = MessageSender.USER,
             text = s2sResult.recognizedText,
@@ -291,13 +320,15 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 missionStatus = newStatus,
                 finalSummary = summary,
                 isProcessing = false,
+                npcEmotion = updatedEmotion,
+                lastEvaluationFeedback = evaluation.feedback,
                 realRamMb = s2sResult.realRamMb,
                 lastLatencyMs = s2sResult.latencyMs,
                 isRecording = if (newStatus != MissionStatus.IN_PROGRESS) false else it.isRecording
             )
         }
 
-        // 8. 播放生成的音訊 (優先播放主引擎生成的波形，若空則走 TTS)
+        // 9. 播放生成的音訊 (優先播放主引擎生成的波形，若空則走 TTS)
         if (s2sResult.audioBytes != null && s2sResult.audioBytes.isNotEmpty()) {
             audioPlayer.playAudioData(s2sResult.audioBytes)
         } else {
@@ -314,6 +345,13 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         audioPlayer.speakText(message.text)
     }
 
+    fun replayLastAiMessage() {
+        val lastTutorMsg = _uiState.value.messages.lastOrNull { it.sender == MessageSender.TUTOR }
+        if (lastTutorMsg != null) {
+            audioPlayer.speakText(lastTutorMsg.text)
+        }
+    }
+
     fun retryCurrentScenario() {
         prepareScenario(_uiState.value.currentScenario)
         playGreetingOnScreenEnter()
@@ -324,14 +362,14 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopAllAudio() {
-        audioRecorder.stopRecording()
+        audioRecorder.stopRecording(flushRemaining = false)
         audioPlayer.stop()
-        _uiState.update { it.copy(isRecording = false, isAiSpeaking = false) }
+        _uiState.update { it.copy(isRecording = false, isAiSpeaking = false, amplitude = 0f, aiAmplitude = 0f) }
     }
 
     override fun onCleared() {
         super.onCleared()
-        audioRecorder.stopRecording()
+        audioRecorder.stopRecording(flushRemaining = false)
         audioPlayer.release()
         s2sEngine.release()
     }

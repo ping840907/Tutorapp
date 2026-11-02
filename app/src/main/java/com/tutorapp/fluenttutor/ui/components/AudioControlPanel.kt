@@ -60,6 +60,7 @@ fun AudioControlPanel(
     onToggleRecording: () -> Unit,
     onToggleAutoVAD: (Boolean) -> Unit,
     onSendManualText: (String) -> Unit,
+    onReplayLastAiMessage: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var textInput by remember { mutableStateOf("") }
@@ -112,9 +113,10 @@ fun AudioControlPanel(
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
                     text = when {
-                        isAiSpeaking -> "AI 正在回話..."
-                        isUserSpeaking -> "偵測到語音輸入 (VAD 活躍)"
-                        isRecording -> "聆聽中 (自動斷句分段發送)"
+                        isAiSpeaking -> "NPC 正在回話..."
+                        isUserSpeaking && isAutoVAD -> "偵測到語音輸入 (VAD 活躍)"
+                        isRecording && isAutoVAD -> "聆聽中 (停頓自動斷句送出)"
+                        isRecording && !isAutoVAD -> "手動錄音中 (再次點擊麥克風送出)"
                         else -> "點擊麥克風開始即時對話"
                     },
                     fontSize = 12.sp,
@@ -177,9 +179,9 @@ fun AudioControlPanel(
                 )
             }
 
-            // 喇叭測試按鈕
+            // 重播最新 NPC 語音按鈕
             IconButton(
-                onClick = { /* 提示 */ },
+                onClick = onReplayLastAiMessage,
                 modifier = Modifier
                     .size(44.dp)
                     .clip(CircleShape)
@@ -187,8 +189,8 @@ fun AudioControlPanel(
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.VolumeUp,
-                    contentDescription = "Audio feedback",
-                    tint = TextSecondary,
+                    contentDescription = "Replay last NPC speech",
+                    tint = PrimaryBlue,
                     modifier = Modifier.size(20.dp)
                 )
             }

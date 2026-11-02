@@ -16,7 +16,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
@@ -47,7 +47,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = DarkBackground
                 ) {
-                    var currentScreen by remember { mutableStateOf(AppScreen.SCENARIO_SELECT) }
+                    var currentScreen by rememberSaveable { mutableStateOf(AppScreen.SCENARIO_SELECT) }
                     val uiState by viewModel.uiState.collectAsState()
                     val lifecycleOwner = LocalLifecycleOwner.current
 
@@ -130,6 +130,9 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onPlayAudio = { message ->
                                     viewModel.playMessageAudio(message)
+                                },
+                                onReplayLastAiMessage = {
+                                    viewModel.replayLastAiMessage()
                                 },
                                 onRetryScenario = {
                                     viewModel.retryCurrentScenario()

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -37,6 +38,7 @@ import com.tutorapp.fluenttutor.ui.components.AudioControlPanel
 import com.tutorapp.fluenttutor.ui.components.ChatBubble
 import com.tutorapp.fluenttutor.ui.components.GoalProgressCard
 import com.tutorapp.fluenttutor.ui.components.MissionResultDialog
+import com.tutorapp.fluenttutor.ui.components.NpcAvatarCard
 import com.tutorapp.fluenttutor.ui.theme.DarkBackground
 import com.tutorapp.fluenttutor.ui.theme.PrimaryBlue
 import com.tutorapp.fluenttutor.ui.theme.SecondaryTeal
@@ -55,6 +57,7 @@ fun ConversationScreen(
     onToggleAutoVAD: (Boolean) -> Unit,
     onSendManualText: (String) -> Unit,
     onPlayAudio: (com.tutorapp.fluenttutor.model.ChatMessage) -> Unit,
+    onReplayLastAiMessage: () -> Unit,
     onRetryScenario: () -> Unit,
     onDismissDialog: () -> Unit
 ) {
@@ -63,7 +66,7 @@ fun ConversationScreen(
     // 系統實體返回按鍵處理
     BackHandler(onBack = onBack)
 
-    // 僅在使用者真正進入對話畫面時，才主動觸發 AI 的開場問候語 (修復一啟動就搶講話的 bug)
+    // 僅在使用者真正進入對話畫面時，才主動觸發 AI 的開場問候語 (具備防旋轉重複播放保護)
     LaunchedEffect(Unit) {
         onEnterScreen()
     }
@@ -120,11 +123,12 @@ fun ConversationScreen(
                 isRecording = uiState.isRecording,
                 isUserSpeaking = uiState.isUserSpeaking,
                 isAiSpeaking = uiState.isAiSpeaking,
-                amplitude = uiState.amplitude,
+                amplitude = uiState.activeAmplitude,
                 isAutoVAD = uiState.isAutoVAD,
                 onToggleRecording = onToggleRecording,
                 onToggleAutoVAD = onToggleAutoVAD,
-                onSendManualText = onSendManualText
+                onSendManualText = onSendManualText,
+                onReplayLastAiMessage = onReplayLastAiMessage
             )
         }
     ) { paddingValues ->
@@ -138,7 +142,19 @@ fun ConversationScreen(
                     .fillMaxSize()
                     .padding(horizontal = 14.dp)
             ) {
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(4.dp))
+
+                // 動態 NPC 講話頭像與表情狀態卡片
+                NpcAvatarCard(
+                    roleName = uiState.currentScenario.roleName,
+                    avatarStyle = uiState.currentScenario.avatarStyle,
+                    interactionState = uiState.npcInteractionState,
+                    emotion = uiState.npcEmotion,
+                    voiceAmplitude = uiState.activeAmplitude,
+                    lastEvaluateFeedback = uiState.lastEvaluationFeedback
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
 
                 // 任務目標進度與偏離 Strike 卡片
                 GoalProgressCard(
@@ -147,7 +163,7 @@ fun ConversationScreen(
                     maxStrikes = uiState.currentScenario.maxOffTopicStrikes
                 )
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 // 對話訊息滾動清單
                 LazyColumn(
@@ -165,12 +181,12 @@ fun ConversationScreen(
                 }
             }
 
-            // SM8850 S2S 推論中指示器
+            // SM8850 S2S 推論中指示器 (修正原本變形的圓形進度條尺寸)
             if (uiState.isProcessing) {
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
-                        .padding(top = 16.dp)
+                        .padding(top = 12.dp)
                         .clip(RoundedCornerShape(20.dp))
                         .background(SurfaceDark.copy(alpha = 0.95f))
                         .padding(horizontal = 16.dp, vertical = 8.dp)
@@ -181,7 +197,9 @@ fun ConversationScreen(
                         CircularProgressIndicator(
                             color = PrimaryBlue,
                             strokeWidth = 2.dp,
-                            modifier = Modifier.padding(end = 8.dp).height(16.dp).fillMaxWidth(0.1f)
+                            modifier = Modifier
+                                .padding(end = 8.dp)
+                                .size(16.dp)
                         )
                         Text(
                             text = "SM8850 S2S Speech Generating...",
