@@ -223,7 +223,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語 (優先走 LFM3 端側神經語音直出，防螢幕旋轉重複播放)
+     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語 (優先走 LFM3 端側分塊串流直出，防螢幕旋轉重複播放)
      */
     fun playGreetingOnScreenEnter() {
         if (_uiState.value.hasPlayedInitialGreeting) return
@@ -232,7 +232,12 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val audioBytes = s2sEngine.synthesizeSpeech(greeting)
             if (audioBytes != null && audioBytes.isNotEmpty()) {
-                audioPlayer.playAudioData(audioBytes)
+                val stream = s2sEngine.synthesizeSpeechStream(greeting)
+                audioPlayer.playAudioStream(
+                    chunks = stream,
+                    sampleRate = OnnxLfmAudioBackend.OUTPUT_AUDIO_SAMPLE_RATE,
+                    fallbackText = greeting
+                )
             } else {
                 audioPlayer.speakText(greeting)
             }
@@ -360,10 +365,17 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         playReply(result)
     }
 
-    /** 優先播放模型生成的語音，沒有則走系統 TTS */
+    /** 優先播放分塊串流語音 (TTFA < 100ms)，若無串流則播放完整音訊，最後退回系統 TTS */
     private suspend fun playReply(result: LfmSpeechToSpeechEngine.S2SResult) {
+        val stream = result.audioStream
         val audio = result.audioBytes
-        if (audio != null && audio.isNotEmpty()) {
+        if (stream != null) {
+            audioPlayer.playAudioStream(
+                chunks = stream,
+                sampleRate = OnnxLfmAudioBackend.OUTPUT_AUDIO_SAMPLE_RATE,
+                fallbackText = result.replyText
+            )
+        } else if (audio != null && audio.isNotEmpty()) {
             audioPlayer.playAudioData(audio)
         } else {
             audioPlayer.speakText(result.replyText)

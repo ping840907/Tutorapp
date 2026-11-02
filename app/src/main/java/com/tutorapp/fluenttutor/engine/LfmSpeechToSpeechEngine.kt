@@ -4,6 +4,7 @@ import android.os.Debug
 import com.tutorapp.fluenttutor.model.MissionGoal
 import com.tutorapp.fluenttutor.model.Scenario
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 
 /**
@@ -31,6 +32,7 @@ class LfmSpeechToSpeechEngine(
         /** 解析成功的結構化輸出；解析失敗為 null (該回合不計分、不改變任務狀態) */
         val output: ModelTurnOutput?,
         val audioBytes: ByteArray?,
+        val audioStream: Flow<ByteArray>? = null,
         val latencyMs: Long,
         val realRamMb: Long
     )
@@ -64,12 +66,15 @@ class LfmSpeechToSpeechEngine(
             replyText = reply,
             output = output,
             audioBytes = raw.audioBytes,
+            audioStream = raw.audioStream,
             latencyMs = (System.nanoTime() - startNano) / 1_000_000L,
             realRamMb = memoryProbe()
         )
     }
 
     fun synthesizeSpeech(text: String): ByteArray? = backend.synthesizeSpeech(text)
+
+    fun synthesizeSpeechStream(text: String): Flow<ByteArray> = backend.synthesizeSpeechStream(text)
 
     fun release() = backend.release()
 }

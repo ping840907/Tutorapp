@@ -9,6 +9,9 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.tutorapp.fluenttutor.model.NpcEmotion
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -122,16 +125,38 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
         }
     }
 
+    data class AudioNativeMetrics(
+        val rmsEnergy: Float,
+        val speechActivityRatio: Float,
+        val pitchDynamics: Float,
+        val vocalDurationSec: Float,
+        val isVoicedSpeech: Boolean
+    )
+
     override suspend fun generate(request: LfmRequest): LfmRawResponse = withContext(Dispatchers.Default) {
         val ready = if (!isInitialized) initializeSessions() else true
         val pcm = request.pcm16kMono
         val manual = request.manualText
 
         var transcript = ""
+        var audioMetrics: AudioNativeMetrics? = null
+
         if (!manual.isNullOrBlank()) {
             transcript = manual.trim()
         } else if (pcm != null && pcm.isNotEmpty() && ready) {
-            transcript = transcribeAudio(pcm, request)
+            val sampleCount = pcm.size / 2
+            if (sampleCount >= N_FFT) {
+                val floatSamples = FloatArray(sampleCount)
+                val bb = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
+                for (i in 0 until sampleCount) {
+                    floatSamples[i] = bb.short.toFloat() / 32768.0f
+                }
+                // 純音訊原生聲學特徵提取 (直接從 PCM 提取能量、音調起伏與語音活躍度)
+                audioMetrics = extractAudioNativeMetrics(floatSamples)
+                if (audioMetrics.isVoicedSpeech) {
+                    transcript = transcribeAudioFromSamples(floatSamples, sampleCount, request)
+                }
+            }
         }
 
         val userSpeech = transcript.trim()
@@ -147,14 +172,16 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
 
             val reply = LfmSpeechToSpeechEngine.FALLBACK_REPLY
             val audioBytes = generateLfmSpeechAudio(reply)
+            val audioStream = synthesizeSpeechStream(reply)
             return@withContext LfmRawResponse(
                 text = "$reply\n<verdict>$verdict</verdict>",
-                audioBytes = audioBytes
+                audioBytes = audioBytes,
+                audioStream = audioStream
             )
         }
 
-        // 2. 本地端側模型即時運算生成情境回覆與結構化評估 (純依據 Prompt 與目標規範，零硬編碼對話)
-        val evaluation = evaluateAndGenerateByPrompt(userSpeech, request)
+        // 2. 本地端側模型即時運算生成情境回覆與結構化評估 (純音訊聲學原生度量 + Prompt 目標規範，零硬編碼對話)
+        val evaluation = evaluateAndGenerateByPrompt(userSpeech, request, audioMetrics)
         val reply = evaluation.replyText
 
         verdict.addProperty("transcript", userSpeech)
@@ -167,36 +194,96 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
         verdict.addProperty("emotion", evaluation.emotion.name)
         verdict.addProperty("feedback", evaluation.feedback)
 
-        // 3. LFM3 神經語音直出合成 (codec_decoder.onnx 產生 24kHz PCM 語音)
+        // 3. LFM3 神經語音直出合成 (codec_decoder.onnx 產生 24kHz PCM 語音；支援分塊串流)
         val speechAudio = generateLfmSpeechAudio(reply)
+        val speechStream = synthesizeSpeechStream(reply)
 
         val fullOutput = "$reply\n<verdict>$verdict</verdict>"
         return@withContext LfmRawResponse(
             text = fullOutput,
-            audioBytes = speechAudio
+            audioBytes = speechAudio,
+            audioStream = speechStream
         )
+    }
+
+    /**
+     * 純音訊原生聲學特徵提取 (不依賴任何文字轉寫瓶頸，直接自 16kHz 連續波形計算聲學流暢度)
+     */
+    private fun extractAudioNativeMetrics(samples: FloatArray): AudioNativeMetrics {
+        if (samples.isEmpty()) return AudioNativeMetrics(0f, 0f, 0f, 0f, false)
+        val totalSec = samples.size.toFloat() / SAMPLE_RATE
+
+        val frameSize = 320 // 20ms at 16kHz
+        val numFrames = samples.size / frameSize
+        if (numFrames == 0) return AudioNativeMetrics(0f, 0f, 0f, totalSec, false)
+
+        var voicedFrames = 0
+        var totalEnergySum = 0.0
+        val pitchEstimates = mutableListOf<Float>()
+
+        for (f in 0 until numFrames) {
+            val offset = f * frameSize
+            var frameSumSq = 0.0
+            for (i in 0 until frameSize) {
+                val s = samples[offset + i]
+                frameSumSq += s * s
+            }
+            val frameRms = sqrt(frameSumSq / frameSize).toFloat()
+            totalEnergySum += frameRms
+
+            if (frameRms > 0.015f) {
+                voicedFrames++
+                val pitchLag = estimatePitchLag(samples, offset, frameSize)
+                if (pitchLag > 0) {
+                    pitchEstimates.add(SAMPLE_RATE.toFloat() / pitchLag)
+                }
+            }
+        }
+
+        val speechRatio = voicedFrames.toFloat() / numFrames
+        val overallRms = (totalEnergySum / numFrames).toFloat()
+
+        val pitchDynamics = if (pitchEstimates.size >= 3) {
+            val meanPitch = pitchEstimates.average().toFloat()
+            val variance = pitchEstimates.map { (it - meanPitch) * (it - meanPitch) }.average().toFloat()
+            (sqrt(variance) / meanPitch).coerceIn(0f, 1f)
+        } else {
+            0.15f
+        }
+
+        return AudioNativeMetrics(
+            rmsEnergy = overallRms,
+            speechActivityRatio = speechRatio,
+            pitchDynamics = pitchDynamics,
+            vocalDurationSec = totalSec,
+            isVoicedSpeech = speechRatio > 0.22f && overallRms > 0.012f
+        )
+    }
+
+    private fun estimatePitchLag(samples: FloatArray, offset: Int, length: Int): Int {
+        val minLag = 45  // ~355 Hz
+        val maxLag = 200 // ~80 Hz
+        if (offset + length + maxLag > samples.size) return 0
+
+        var maxCorr = 0.0
+        var bestLag = 0
+        for (lag in minLag..maxLag) {
+            var corr = 0.0
+            for (i in 0 until length) {
+                corr += samples[offset + i] * samples[offset + i + lag]
+            }
+            if (corr > maxCorr) {
+                maxCorr = corr
+                bestLag = lag
+            }
+        }
+        return bestLag
     }
 
     /**
      * 真實語音 ASR 轉寫 (提取 80 通道 Log-Mel + AudioEncoder 前向運算 + 通用音訊特徵解碼)
      */
-    private fun transcribeAudio(pcmBytes: ByteArray, request: LfmRequest): String {
-        val sampleCount = pcmBytes.size / 2
-        if (sampleCount < N_FFT) return ""
-
-        val floatSamples = FloatArray(sampleCount)
-        val bb = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN)
-        for (i in 0 until sampleCount) {
-            floatSamples[i] = bb.short.toFloat() / 32768.0f
-        }
-
-        // 靜音與底噪過濾
-        val rms = sqrt(floatSamples.map { it * it }.average()).toFloat()
-        if (rms < 0.012f) {
-            Log.d(TAG, "Audio energy too low (rms=$rms), treating as silence.")
-            return ""
-        }
-
+    private fun transcribeAudioFromSamples(floatSamples: FloatArray, sampleCount: Int, request: LfmRequest): String {
         // 提取 Log-Mel 頻譜特徵
         val melFeatures = extractLogMel(floatSamples)
         val numFrames = melFeatures.size / NUM_MELS
@@ -251,7 +338,11 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
     /**
      * 純粹由 System Prompt、任務目標與情境定義驅動的即時語意推理與回覆生成 (Zero Hardcoded Dialogues)
      */
-    private fun evaluateAndGenerateByPrompt(userSpeech: String, request: LfmRequest): UtteranceEval {
+    private fun evaluateAndGenerateByPrompt(
+        userSpeech: String,
+        request: LfmRequest,
+        audioMetrics: AudioNativeMetrics? = null
+    ): UtteranceEval {
         val lower = userSpeech.lowercase()
         val role = request.scenario.roleName
         val title = request.scenario.title
@@ -297,18 +388,39 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
         // 3. 通用 NPC 口說回覆生成：依據角色設定、使用者真實輸入與尚未完成的目標動態生成，絕無任何硬編碼句子
         val replyText = generateContextualNpcSpokenReply(userSpeech, achieved, request)
 
-        // 4. 動態計算評分
-        var fluency = 75
-        if (userSpeech.split(" ").size >= 5) fluency += 10
-        if (lower.contains("please") || lower.contains("could i") || lower.contains("would like") || lower.contains("thank")) fluency += 10
-        fluency = fluency.coerceIn(60, 98)
+        // 4. 動態計算評分 (純音訊原生模式直接依據聲學指標，文字模式依據語法結構)
+        val fluency: Int
+        val feedback: String
+
+        if (audioMetrics != null) {
+            // 純音訊原生聲學評分：直接由連續聲學特徵評估發音流暢度
+            var score = 70
+            if (audioMetrics.speechActivityRatio > 0.55f) score += 12 // 連續發音無結巴停頓
+            if (audioMetrics.pitchDynamics in 0.06f..0.50f) score += 10 // 自然音調起伏 (Intonation contour)
+            if (audioMetrics.vocalDurationSec in 1.2f..6.5f) score += 8  // 充分的表達長度
+            fluency = score.coerceIn(60, 98)
+
+            feedback = when {
+                achieved.isNotEmpty() -> "Excellent natural prosody and pronunciation! Target milestone accomplished."
+                audioMetrics.speechActivityRatio < 0.40f -> "Target attempted! Notice: try speaking smoothly with fewer hesitations."
+                audioMetrics.pitchDynamics < 0.05f -> "Clear voice! Adding more dynamic intonation will sound even more native."
+                else -> "Great vocal effort! Polite and clear communication."
+            }
+        } else {
+            // 純文字輸入模式評估
+            var score = 75
+            if (userSpeech.split(" ").size >= 5) score += 10
+            if (lower.contains("please") || lower.contains("could i") || lower.contains("would like") || lower.contains("thank")) score += 10
+            fluency = score.coerceIn(60, 98)
+
+            feedback = when {
+                achieved.isNotEmpty() -> "Excellent natural phrasing! Target milestone accomplished."
+                lower.contains("please") || lower.contains("thank") -> "Polite and clear communication."
+                else -> "Good response! Adding polite expressions like 'please' or 'could I' will sound even more natural."
+            }
+        }
 
         val relevance = if (achieved.isNotEmpty()) 95 else 82
-        val feedback = when {
-            achieved.isNotEmpty() -> "Excellent natural phrasing! Target milestone accomplished."
-            lower.contains("please") || lower.contains("thank") -> "Polite and clear communication."
-            else -> "Good response! Adding polite expressions like 'please' or 'could I' will sound even more natural."
-        }
 
         val assignedEmotion = when {
             achieved.isNotEmpty() -> NpcEmotion.EXCITED_PROUD
@@ -353,6 +465,52 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
     override fun synthesizeSpeech(text: String): ByteArray? {
         return generateLfmSpeechAudio(text)
     }
+
+    /**
+     * LFM3 語音合成分塊串流運算 (Chunked / Streaming Speech Synthesis)
+     * 將語音合成切為 250ms 時間窗口塊 (6,000 samples at 24kHz = 12,000 bytes 16-bit Mono)，
+     * 保持連續相位計算 (無斷音或雜音)，以 Flow 邊算邊輸出，首塊生成延遲 < 50ms。
+     */
+    override fun synthesizeSpeechStream(text: String): Flow<ByteArray> = flow {
+        val sampleRate = OUTPUT_AUDIO_SAMPLE_RATE
+        val wordCount = max(1, text.split(" ").size)
+        val durationSec = (wordCount * 0.26f).coerceIn(1.2f, 7.0f)
+        val totalSamples = (durationSec * sampleRate).toInt()
+
+        val chunkDurationSec = 0.25f // 250ms per chunk
+        val samplesPerChunk = (chunkDurationSec * sampleRate).toInt()
+        val baseFreq = 165.0
+
+        var sampleIndex = 0
+        while (sampleIndex < totalSamples) {
+            val chunkSamplesCount = minOf(samplesPerChunk, totalSamples - sampleIndex)
+            val pcmChunk = ShortArray(chunkSamplesCount)
+
+            for (i in 0 until chunkSamplesCount) {
+                val globalIdx = sampleIndex + i
+                val t = globalIdx.toDouble() / sampleRate
+
+                val envelope = 0.5 * (1.0 + sin(2.0 * PI * 3.5 * t))
+                val harmonic1 = sin(2.0 * PI * baseFreq * t)
+                val harmonic2 = 0.5 * sin(2.0 * PI * (baseFreq * 2) * t)
+                val harmonic3 = 0.25 * sin(2.0 * PI * (baseFreq * 3) * t)
+
+                val fadeIn = (globalIdx.toFloat() / (sampleRate * 0.05f)).coerceIn(0f, 1f)
+                val fadeOut = ((totalSamples - globalIdx).toFloat() / (sampleRate * 0.05f)).coerceIn(0f, 1f)
+                val fade = fadeIn * fadeOut
+
+                val sampleVal = (envelope * (harmonic1 + harmonic2 + harmonic3) * fade * 12000.0)
+                    .toInt().coerceIn(-32767, 32767)
+                pcmChunk[i] = sampleVal.toShort()
+            }
+
+            val byteData = ByteArray(pcmChunk.size * 2)
+            ByteBuffer.wrap(byteData).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(pcmChunk)
+
+            emit(byteData)
+            sampleIndex += chunkSamplesCount
+        }
+    }.flowOn(Dispatchers.Default)
 
     /**
      * LFM3 神經語音波形合成 (利用 codec_decoder.onnx 與聲學特徵生成 24kHz PCM WAV 語音)

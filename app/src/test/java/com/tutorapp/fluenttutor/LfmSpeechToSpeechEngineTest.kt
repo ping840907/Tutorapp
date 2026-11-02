@@ -145,4 +145,26 @@ class LfmSpeechToSpeechEngineTest {
         assertEquals(90, result.output!!.fluency)
         assertEquals(NpcEmotion.EXCITED_PROUD, result.output!!.emotion)
     }
+
+    @Test
+    fun testSynthesizeSpeechStreamEmitsChunks() = runBlocking {
+        val chunkList = mutableListOf<ByteArray>()
+        val fakeStreamingBackend = object : LfmBackend {
+            override suspend fun generate(request: LfmRequest): LfmRawResponse = LfmRawResponse("ok")
+            override fun synthesizeSpeechStream(text: String) = kotlinx.coroutines.flow.flow {
+                // 模擬 250ms chunks (6000 samples = 12000 bytes)
+                repeat(4) {
+                    emit(ByteArray(12000))
+                }
+            }
+            override fun release() {}
+        }
+        val engine = LfmSpeechToSpeechEngine(fakeStreamingBackend)
+        engine.synthesizeSpeechStream("Hello this is a test").collect { chunk ->
+            chunkList.add(chunk)
+        }
+
+        assertEquals(4, chunkList.size)
+        assertEquals(12000, chunkList[0].size)
+    }
 }

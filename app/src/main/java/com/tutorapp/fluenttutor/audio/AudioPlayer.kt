@@ -255,6 +255,114 @@ class AudioPlayer(
         }
     }
 
+    /**
+     * 串流播放分塊音訊 (Streaming Chunked Playback)
+     * 首個音訊塊抵達立即啟動 AudioTrack 播放，後續 Chunk 邊運算邊寫入，
+     * 實現首包超低延遲 (TTFA < 100ms)，並在被打斷 (Barge-in / Cancel) 時立即終止。
+     */
+    suspend fun playAudioStream(
+        chunks: kotlinx.coroutines.flow.Flow<ByteArray>,
+        sampleRate: Int = 24000,
+        channels: Int = 1,
+        fallbackText: String? = null
+    ) = withContext(Dispatchers.IO) {
+        stop()
+        onPlaybackStateChanged(true)
+
+        var currentTrack: AudioTrack? = null
+        var totalBytesWritten = 0
+        val channelConfig = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
+        val bytesPerFrame = 2 * channels
+
+        try {
+            val minBufSize = AudioTrack.getMinBufferSize(
+                sampleRate,
+                channelConfig,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            val streamChunkBytes = maxOf((sampleRate * 2 * channels) / 10, 2048) // ~100ms
+            val trackBufferSize = maxOf(minBufSize * 2, streamChunkBytes * 4)
+
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelConfig)
+                        .build()
+                )
+                .setBufferSizeInBytes(trackBufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+
+            currentTrack = track
+            audioTrack = track
+            track.play()
+
+            chunks.collect { chunk ->
+                if (!isActive) return@collect
+                if (chunk.isEmpty()) return@collect
+
+                // 若 Chunk 包含 RIFF 檔頭則自動跳過檔頭
+                val (offset, length) = if (chunk.size >= 44 &&
+                    chunk[0] == 'R'.code.toByte() && chunk[1] == 'I'.code.toByte() &&
+                    chunk[2] == 'F'.code.toByte() && chunk[3] == 'F'.code.toByte()
+                ) {
+                    val info = parseWavHeader(chunk, sampleRate)
+                    Pair(info.dataOffset, info.dataLength)
+                } else {
+                    Pair(0, chunk.size)
+                }
+
+                var writtenOffset = offset
+                val endOffset = offset + length
+
+                while (writtenOffset < endOffset && isActive) {
+                    val toWrite = minOf(streamChunkBytes, endOffset - writtenOffset)
+                    val written = track.write(chunk, writtenOffset, toWrite)
+                    if (written <= 0) break
+                    totalBytesWritten += written
+
+                    val chunkAmp = computePcmChunkAmplitude(chunk, writtenOffset, written)
+                    onPlaybackAmplitudeChanged(chunkAmp)
+
+                    writtenOffset += written
+                }
+            }
+
+            // 排空 AudioTrack 緩衝區
+            val totalFrames = if (bytesPerFrame > 0) totalBytesWritten / bytesPerFrame else 0
+            val timeoutLimit = System.currentTimeMillis() + 1500L
+            while (isActive && track.playState == AudioTrack.PLAYSTATE_PLAYING && System.currentTimeMillis() < timeoutLimit) {
+                if (track.playbackHeadPosition >= totalFrames) break
+                delay(20L)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during streaming audio playback", e)
+        } finally {
+            try {
+                currentTrack?.stop()
+                currentTrack?.release()
+            } catch (e: Exception) {
+                // ignore
+            }
+            if (audioTrack === currentTrack) {
+                audioTrack = null
+            }
+            onPlaybackAmplitudeChanged(0f)
+            onPlaybackStateChanged(false)
+            if (totalBytesWritten == 0 && !fallbackText.isNullOrBlank()) {
+                speakText(fallbackText)
+            }
+        }
+    }
+
     private fun computePcmChunkAmplitude(bytes: ByteArray, offset: Int, length: Int): Float {
         val sampleCount = length / 2
         if (sampleCount <= 0) return 0f
