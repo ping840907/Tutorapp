@@ -28,5 +28,6 @@ class LfmRawResponse(
  */
 interface LfmBackend {
     suspend fun generate(request: LfmRequest): LfmRawResponse
+    fun synthesizeSpeech(text: String): ByteArray? = null
     fun release()
 }

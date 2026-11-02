@@ -378,41 +378,55 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
     }
 
     /**
-     * 根據情境與對話歷史動態構建 NPC 回應
+     * 根據情境與對話歷史動態構建 NPC 回應 (具備口語實體抽取與上下文回顯)
      */
     private fun generateDynamicNpcSpokenReply(userSpeech: String, achieved: List<String>, request: LfmRequest): String {
         val lower = userSpeech.lowercase()
 
         return when (request.scenario.id) {
             "cafe_order_en" -> {
-                return when {
-                    achieved.contains("goal_payment") || lower.contains("card") || lower.contains("cash") -> {
-                        val paymentType = if (lower.contains("cash")) "cash" else "card"
-                        "Perfect, $paymentType payment accepted! Here is your receipt and your fresh drink. Have an amazing day!"
+                // 智慧抽取使用者提及的客製化飲品實體
+                val drinkEntity = when {
+                    lower.contains("cappuccino") -> "cappuccino"
+                    lower.contains("americano") -> "americano"
+                    lower.contains("flat white") -> "flat white"
+                    lower.contains("mocha") -> "mocha"
+                    lower.contains("espresso") -> "espresso"
+                    lower.contains("tea") -> "tea"
+                    else -> "latte"
+                }
+                val milkEntity = if (lower.contains("almond")) "almond milk" else if (lower.contains("soy")) "soy milk" else "oat milk"
+                val extraEntity = if (lower.contains("caramel")) " with caramel" else if (lower.contains("vanilla")) " with vanilla" else if (lower.contains("decaf")) " (decaf)" else ""
+
+                when {
+                    achieved.contains("goal_payment") || lower.contains("card") || lower.contains("cash") || lower.contains("apple pay") -> {
+                        val paymentType = if (lower.contains("cash")) "cash" else if (lower.contains("apple")) "Apple Pay" else "card"
+                        "Perfect, $paymentType payment accepted! Here is your receipt and your handcrafted $drinkEntity$extraEntity. Have a wonderful day!"
                     }
                     achieved.contains("goal_temp_size") || lower.contains("iced") || lower.contains("hot") || lower.contains("medium") || lower.contains("large") -> {
-                        val temp = if (lower.contains("iced")) "iced" else "hot"
-                        val size = if (lower.contains("large")) "large" else if (lower.contains("small")) "small" else "medium"
-                        "Awesome, a $temp $size oat milk latte! That comes to $5.25. How would you like to pay today: card or cash?"
+                        val temp = if (lower.contains("iced") || lower.contains("cold")) "iced" else "hot"
+                        val size = if (lower.contains("large") || lower.contains("venti")) "large" else if (lower.contains("small") || lower.contains("tall")) "small" else "medium"
+                        "Awesome, a $temp $size $milkEntity $drinkEntity$extraEntity! That comes out to $5.25. How would you like to pay today: card or cash?"
                     }
-                    achieved.contains("goal_drink_oat") || lower.contains("latte") || lower.contains("coffee") -> {
-                        "An oat milk latte, great choice! Would you like that hot or iced, and what size can I get for you: small, medium, or large?"
+                    achieved.contains("goal_drink_oat") || lower.contains("latte") || lower.contains("coffee") || lower.contains("cappuccino") || lower.contains("americano") -> {
+                        "A $milkEntity $drinkEntity$extraEntity, fantastic choice! Would you like that hot or iced, and what size can I get for you: small, medium, or large?"
                     }
                     else -> {
-                        "Hi there! Welcome to the cafe. What fresh beverage can I prepare for you today?"
+                        "Hi there! Welcome to Coffee Central. What fresh beverage can I prepare for you today?"
                     }
                 }
             }
             "hotel_checkin_en" -> {
-                return when {
-                    achieved.contains("goal_hotel_key") || lower.contains("thank") -> {
-                        "You're very welcome! Here are your room keys for room 512. Elevators are right around the corner. Enjoy your stay!"
+                when {
+                    achieved.contains("goal_hotel_key") || lower.contains("thank") || lower.contains("appreciate") -> {
+                        "You're very welcome! Here are your room keys for room 512. Elevators are right around the corner on your left. Enjoy your stay!"
                     }
-                    achieved.contains("goal_hotel_amenities") || lower.contains("breakfast") || lower.contains("wifi") -> {
-                        "Breakfast is served from 6:30 to 10:00 AM on the 2nd floor, and Wi-Fi is completely free throughout the hotel. Would you like your room keys now?"
+                    achieved.contains("goal_hotel_amenities") || lower.contains("breakfast") || lower.contains("wifi") || lower.contains("pool") || lower.contains("gym") -> {
+                        val extraFacility = if (lower.contains("pool") || lower.contains("gym")) " Fitness center and pool are open 24/7 on the 3rd floor." else ""
+                        "Breakfast is served from 6:30 to 10:00 AM on the 2nd floor, and high-speed Wi-Fi is completely free throughout the hotel.$extraFacility Would you like your room keys now?"
                     }
-                    achieved.contains("goal_hotel_checkin") || lower.contains("reservation") || lower.contains("check") -> {
-                        "Welcome to the Grand Hotel! I found your reservation right here. Do you have any questions about breakfast or hotel amenities before I issue your keys?"
+                    achieved.contains("goal_hotel_checkin") || lower.contains("reservation") || lower.contains("check") || lower.contains("booking") -> {
+                        "Welcome to the Grand Hotel! I found your reservation confirmed right here in our system. Do you have any questions about breakfast or hotel amenities before I issue your keys?"
                     }
                     else -> {
                         "Good afternoon! Welcome to the Grand Hotel. Are you checking in with us today?"
@@ -420,15 +434,15 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
                 }
             }
             "airport_boarding_en" -> {
-                return when {
-                    achieved.contains("goal_gate_time") || lower.contains("gate") -> {
-                        "Your flight boards at Gate B18 in approximately 35 minutes. Have a pleasant flight and safe travels!"
+                when {
+                    achieved.contains("goal_gate_time") || lower.contains("gate") || lower.contains("time") -> {
+                        "Your flight boards at Gate B18 in approximately 35 minutes. Priority boarding begins shortly. Have a pleasant flight and safe travels!"
                     }
-                    achieved.contains("goal_seat_choice") || lower.contains("window") || lower.contains("aisle") -> {
+                    achieved.contains("goal_seat_choice") || lower.contains("window") || lower.contains("aisle") || lower.contains("seat") -> {
                         val pref = if (lower.contains("window")) "window seat 14A" else "aisle seat 14C"
-                        "I've got you confirmed for $pref! Do you need to know your departure gate and boarding time?"
+                        "I've got you confirmed for $pref with extra legroom! Do you need to know your departure gate and boarding time?"
                     }
-                    achieved.contains("goal_flight_info") || lower.contains("flight") || lower.contains("passport") -> {
+                    achieved.contains("goal_flight_info") || lower.contains("flight") || lower.contains("passport") || lower.contains("ticket") -> {
                         "Thank you, I have verified your passport and ticket for Flight 302! Would you prefer a window or an aisle seat for this flight?"
                     }
                     else -> {
@@ -438,6 +452,10 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
             }
             else -> "Thank you! I received your response and look forward to continuing our conversation."
         }
+    }
+
+    override fun synthesizeSpeech(text: String): ByteArray? {
+        return generateLfmSpeechAudio(text)
     }
 
     /**

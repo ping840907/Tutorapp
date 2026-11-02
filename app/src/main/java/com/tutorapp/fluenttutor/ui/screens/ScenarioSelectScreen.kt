@@ -6,6 +6,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,6 +22,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -30,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -119,6 +124,47 @@ fun ScenarioSelectScreen(
                 }
             }
 
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // 模型檔案就緒狀態引導卡片
+            val isModelReady = remember {
+                val paths = listOf(
+                    "/sdcard/Android/data/com.tutorapp.fluenttutor/files/models/lfm3_audio/decoder_q4.onnx",
+                    "/data/local/tmp/lfm3_audio/decoder_q4.onnx"
+                )
+                paths.any { java.io.File(it).exists() }
+            }
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isModelReady) SurfaceVariantDark.copy(alpha = 0.6f) else PrimaryBlue.copy(alpha = 0.12f)
+                )
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (isModelReady) Icons.Default.CheckCircle else Icons.Default.Info,
+                        contentDescription = "Model Status",
+                        tint = if (isModelReady) SecondaryTeal else PrimaryBlue,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (isModelReady) {
+                            "端側 2B 模型檔案已就緒 (ONNX Runtime 1.28.0 • 4 核心並行)"
+                        } else {
+                            "模型路徑: /sdcard/Android/data/com.tutorapp.fluenttutor/files/models/lfm3_audio/"
+                        },
+                        fontSize = 11.sp,
+                        color = if (isModelReady) SecondaryTeal else TextSecondary
+                    )
+                }
+            }
+
             Spacer(modifier = Modifier.height(16.dp))
 
             Text(
@@ -144,6 +190,7 @@ fun ScenarioSelectScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ScenarioCard(
     scenario: Scenario,
@@ -206,28 +253,36 @@ fun ScenarioCard(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 目標清單標籤
-            Row(
+            // 目標清單標籤 (採用 FlowRow 自適應折行排版，徹底杜絕第三欄被擠壓成長條)
+            FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text(
-                    text = "目標:",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = TextMuted
-                )
-                scenario.goals.forEach { goal ->
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(PrimaryBlue.copy(alpha = 0.15f))
+                        .padding(horizontal = 7.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        text = "目標",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = PrimaryBlue
+                    )
+                }
+                scenario.goals.forEachIndexed { index, goal ->
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(RoundedCornerShape(6.dp))
                             .background(SurfaceVariantDark)
                             .padding(horizontal = 8.dp, vertical = 3.dp)
                     ) {
                         Text(
-                            text = goal.title,
-                            fontSize = 10.sp,
-                            color = TextPrimary
+                            text = "${index + 1}. ${goal.title}",
+                            fontSize = 11.sp,
+                            color = TextSecondary
                         )
                     }
                 }

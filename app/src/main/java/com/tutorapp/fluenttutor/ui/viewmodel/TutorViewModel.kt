@@ -101,8 +101,8 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile
     private var session = Session()
 
-    // 音訊錄音器 (硬體 AEC 與自適應 VAD)；需先於 audioPlayer 宣告，因為播放狀態回呼會用到它
-    private val audioRecorder = AudioRecorder(
+    // 音訊錄音器 (硬體 AEC、自適應 VAD 與全雙工即時打斷 Barge-in)；需顯式宣告型別避免互相遞迴推導
+    private val audioRecorder: AudioRecorder = AudioRecorder(
         onSegmentReady = { pcmData, durationMs ->
             enqueueAudioSegment(pcmData, durationMs)
         },
@@ -111,11 +111,16 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         },
         onSpeechStatusChanged = { isSpeaking ->
             _uiState.update { it.copy(isUserSpeaking = isSpeaking) }
+        },
+        onBargeInTriggered = {
+            // 使用者在 AI 發言時主動開口打斷：立即停止播放，讓對話主控權回到使用者
+            audioPlayer.stop()
+            _uiState.update { it.copy(isAiSpeaking = false, aiAmplitude = 0f) }
         }
     )
 
     // 音訊播放器 (支援 WAV 標頭解析、即時語音振幅同步與半雙工保護)
-    private val audioPlayer = AudioPlayer(
+    private val audioPlayer: AudioPlayer = AudioPlayer(
         context = application,
         onPlaybackStateChanged = { isPlaying ->
             _uiState.update { it.copy(isAiSpeaking = isPlaying) }
@@ -218,13 +223,20 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語 (具備防螢幕旋轉重複播放保護)
+     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語 (優先走 LFM3 端側神經語音直出，防螢幕旋轉重複播放)
      */
     fun playGreetingOnScreenEnter() {
         if (_uiState.value.hasPlayedInitialGreeting) return
         _uiState.update { it.copy(hasPlayedInitialGreeting = true) }
         val greeting = _uiState.value.currentScenario.initialGreeting
-        audioPlayer.speakText(greeting)
+        viewModelScope.launch {
+            val audioBytes = s2sEngine.synthesizeSpeech(greeting)
+            if (audioBytes != null && audioBytes.isNotEmpty()) {
+                audioPlayer.playAudioData(audioBytes)
+            } else {
+                audioPlayer.speakText(greeting)
+            }
+        }
     }
 
     fun toggleRecording() {
@@ -394,6 +406,11 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         audioRecorder.stopRecording(flushRemaining = false)
         audioPlayer.stop()
         _uiState.update { it.copy(isRecording = false, isAiSpeaking = false, amplitude = 0f, aiAmplitude = 0f) }
+    }
+
+    fun onTrimMemory() {
+        Log.i("TutorViewModel", "System memory low, trimming non-essential resources.")
+        System.gc()
     }
 
     override fun onCleared() {

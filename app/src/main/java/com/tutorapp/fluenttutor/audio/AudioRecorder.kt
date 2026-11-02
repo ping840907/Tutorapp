@@ -27,13 +27,16 @@ class AudioRecorder(
     private val sampleRate: Int = 16000,
     private val onSegmentReady: (pcmData: ByteArray, durationMs: Long) -> Unit,
     private val onAmplitudeChanged: (amplitude: Float) -> Unit,
-    private val onSpeechStatusChanged: (isSpeaking: Boolean) -> Unit
+    private val onSpeechStatusChanged: (isSpeaking: Boolean) -> Unit,
+    private val onBargeInTriggered: () -> Unit = {}
 ) {
     companion object {
         private const val TAG = "AudioRecorder"
         private const val PRE_ROLL_CAPACITY_BYTES = 16000 * 2 * 3 / 10 // 300ms 前導環形緩存
         private const val MAX_MANUAL_BUFFER_BYTES = 16000 * 2 * 30    // 手動錄音上限 30 秒 (約 960KB)
         private const val MIN_SEGMENT_DURATION_MS = 200L               // 最短有效語音時長 (支援 short utterances)
+        private const val BARGE_IN_RMS_THRESHOLD = 1100f               // 打斷偵測能量門檻 (大於喇叭洩漏底噪)
+        private const val BARGE_IN_CONSECUTIVE_FRAMES = 2              // 連續 2 幀確認打斷 (約 120ms)
     }
 
     private val lock = Any()
@@ -48,6 +51,7 @@ class AudioRecorder(
     private val preRollBuffer = ByteArray(PRE_ROLL_CAPACITY_BYTES)
     private var preRollHead = 0
     private var preRollFilled = 0
+    private var bargeInConsecutiveCount = 0
 
     @Volatile
     private var isRecording = false
@@ -136,10 +140,23 @@ class AudioRecorder(
                     val currentRecord = audioRecord ?: break
                     val readCount = currentRecord.read(shortBuffer, 0, shortBuffer.size)
                     if (readCount > 0) {
-                        // 若處於半雙工靜音狀態 (AI 正在發言)，直接丟棄避免回音
+                        // 若處於 AI 發言期間，依然進行高能量打斷偵測 (Barge-in detection)
                         if (isHalfDuplexMuted) {
+                            val muteRms = vad.calculateRms(shortBuffer, readCount)
+                            if (muteRms > BARGE_IN_RMS_THRESHOLD) {
+                                bargeInConsecutiveCount++
+                                if (bargeInConsecutiveCount >= BARGE_IN_CONSECUTIVE_FRAMES) {
+                                    Log.i(TAG, "Barge-in triggered by user speech (rms=$muteRms). Interrupting AI speech.")
+                                    bargeInConsecutiveCount = 0
+                                    onBargeInTriggered()
+                                }
+                            } else {
+                                bargeInConsecutiveCount = 0
+                            }
                             onAmplitudeChanged(0.02f)
                             continue
+                        } else {
+                            bargeInConsecutiveCount = 0
                         }
 
                         // 計算 RMS 能量

@@ -69,5 +69,7 @@ class LfmSpeechToSpeechEngine(
         )
     }
 
+    fun synthesizeSpeech(text: String): ByteArray? = backend.synthesizeSpeech(text)
+
     fun release() = backend.release()
 }
