@@ -34,3 +34,10 @@ local.properties
 # OS files
 .DS_Store
 Thumbs.db
+
+# Heavy local AI model binaries
+lfm3_audio/
+*.onnx
+*.onnx_data
+*.gguf
+

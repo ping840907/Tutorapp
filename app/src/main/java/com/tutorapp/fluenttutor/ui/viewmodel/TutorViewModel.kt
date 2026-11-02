@@ -8,7 +8,7 @@ import com.tutorapp.fluenttutor.audio.AudioPlayer
 import com.tutorapp.fluenttutor.audio.AudioRecorder
 import com.tutorapp.fluenttutor.engine.LfmSpeechToSpeechEngine
 import com.tutorapp.fluenttutor.engine.MissionStateMachine
-import com.tutorapp.fluenttutor.engine.StandInLfmBackend
+import com.tutorapp.fluenttutor.engine.OnnxLfmAudioBackend
 import com.tutorapp.fluenttutor.model.ChatMessage
 import com.tutorapp.fluenttutor.model.MessageSender
 import com.tutorapp.fluenttutor.model.MissionFinalSummary
@@ -91,9 +91,8 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<TutorUiState> = _uiState.asStateFlow()
 
-    // 單一模型架構：LFM3-Audio 輸出回覆與評分/目標判定，狀態機只負責驗證與記錄
-    // TODO: 接上真實 LFM3-Audio 後，將 StandInLfmBackend 換成實際的 LfmBackend 實作
-    private val s2sEngine = LfmSpeechToSpeechEngine(StandInLfmBackend(application))
+    // 單一模型架構：真實 Liquid AI LFM3-Audio ONNX 端側推論引擎 (SM8850 加速)
+    private val s2sEngine = LfmSpeechToSpeechEngine(OnnxLfmAudioBackend(application))
     private var stateMachine = MissionStateMachine(initialScenario)
     private var missionState = stateMachine.initialState()
 

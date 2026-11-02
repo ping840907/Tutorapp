@@ -64,7 +64,7 @@ fun ScenarioSelectScreen(
                             color = TextPrimary
                         )
                         Text(
-                            text = "SM8850 Flagship • Dual-Engine S2S Learning",
+                            text = "SM8850 Flagship • LFM3-Audio S2S Engine",
                             style = MaterialTheme.typography.labelSmall,
                             color = SecondaryTeal
                         )
@@ -105,13 +105,13 @@ fun ScenarioSelectScreen(
                     Spacer(modifier = Modifier.width(10.dp))
                     Column {
                         Text(
-                            text = "Snapdragon 8 Elite 端側雙推論架構",
+                            text = "Snapdragon 8 Elite 端側 LFM3-Audio 全語音架構",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold,
                             color = PrimaryBlue
                         )
                         Text(
-                            text = "主引擎 S2S 語音流對話 + 副引擎抗幻覺目標審查與評分",
+                            text = "單模型語音對話 + 任務狀態機防幻覺目標審查與評分",
                             fontSize = 11.sp,
                             color = TextSecondary
                         )

@@ -19,6 +19,9 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+        ndk {
+            abiFilters.addAll(setOf("arm64-v8a"))
+        }
     }
 
     buildTypes {
@@ -44,6 +47,10 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            pickFirsts += "lib/**/libonnxruntime.so"
+            pickFirsts += "lib/**/libc++_shared.so"
+        }
     }
 }
 
@@ -62,6 +69,9 @@ dependencies {
     // Coroutines
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
+
+    // ONNX Runtime (LFM3 Audio ONNX Engine on SM8850)
+    implementation(libs.onnxruntime.android)
 
     // JSON
     implementation(libs.gson)
