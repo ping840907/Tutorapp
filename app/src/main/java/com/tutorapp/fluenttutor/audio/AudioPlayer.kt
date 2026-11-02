@@ -219,8 +219,13 @@ class AudioPlayer(
             var totalBytesWritten = 0
 
             while (offset < endOffset && isActive) {
+                if (track.state != AudioTrack.STATE_INITIALIZED) break
                 val toWrite = minOf(streamChunkBytes, endOffset - offset)
-                val written = track.write(audioBytes, offset, toWrite)
+                val written = try {
+                    track.write(audioBytes, offset, toWrite)
+                } catch (e: IllegalStateException) {
+                    break
+                }
                 if (written <= 0) break
 
                 totalBytesWritten += written
@@ -234,12 +239,14 @@ class AudioPlayer(
             val bytesPerFrame = 2 * wavInfo.channels
             val totalFrames = if (bytesPerFrame > 0) totalBytesWritten / bytesPerFrame else 0
             val timeoutLimit = System.currentTimeMillis() + 1500L
-            while (isActive && track.playState == AudioTrack.PLAYSTATE_PLAYING && System.currentTimeMillis() < timeoutLimit) {
+            while (isActive && track.state == AudioTrack.STATE_INITIALIZED && track.playState == AudioTrack.PLAYSTATE_PLAYING && System.currentTimeMillis() < timeoutLimit) {
                 if (track.playbackHeadPosition >= totalFrames) break
                 delay(20L)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error during audio playback", e)
+            if (e !is kotlinx.coroutines.CancellationException && e !is IllegalStateException) {
+                Log.e(TAG, "Error during audio playback", e)
+            }
         } finally {
             try {
                 currentTrack?.stop()
@@ -324,8 +331,13 @@ class AudioPlayer(
                 val endOffset = offset + length
 
                 while (writtenOffset < endOffset && isActive) {
+                    if (track.state != AudioTrack.STATE_INITIALIZED) break
                     val toWrite = minOf(streamChunkBytes, endOffset - writtenOffset)
-                    val written = track.write(chunk, writtenOffset, toWrite)
+                    val written = try {
+                        track.write(chunk, writtenOffset, toWrite)
+                    } catch (e: IllegalStateException) {
+                        break
+                    }
                     if (written <= 0) break
                     totalBytesWritten += written
 
@@ -339,12 +351,14 @@ class AudioPlayer(
             // 排空 AudioTrack 緩衝區
             val totalFrames = if (bytesPerFrame > 0) totalBytesWritten / bytesPerFrame else 0
             val timeoutLimit = System.currentTimeMillis() + 1500L
-            while (isActive && track.playState == AudioTrack.PLAYSTATE_PLAYING && System.currentTimeMillis() < timeoutLimit) {
+            while (isActive && track.state == AudioTrack.STATE_INITIALIZED && track.playState == AudioTrack.PLAYSTATE_PLAYING && System.currentTimeMillis() < timeoutLimit) {
                 if (track.playbackHeadPosition >= totalFrames) break
                 delay(20L)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error during streaming audio playback", e)
+            if (e !is kotlinx.coroutines.CancellationException && e !is IllegalStateException) {
+                Log.e(TAG, "Error during streaming audio playback", e)
+            }
         } finally {
             try {
                 currentTrack?.stop()
