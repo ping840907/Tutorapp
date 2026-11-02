@@ -18,6 +18,10 @@ import java.nio.ByteOrder
 
 /**
  * 低延遲即時串流音訊錄音器 (SM8850 硬體回音消除與半雙工保護)
+ * 1. 線程安全保護：音訊緩衝區與 Pre-roll 操作均受同步鎖保護
+ * 2. 支援 Short Utterances：最低語音時長降低為 200ms
+ * 3. 解決緩衝區殘留洩漏：無效雜訊觸發時重設緩衝區
+ * 4. 手動錄音設有容量保護上限 (30s)
  */
 class AudioRecorder(
     private val sampleRate: Int = 16000,
@@ -28,13 +32,17 @@ class AudioRecorder(
     companion object {
         private const val TAG = "AudioRecorder"
         private const val PRE_ROLL_CAPACITY_BYTES = 16000 * 2 * 3 / 10 // 300ms 前導環形緩存
+        private const val MAX_MANUAL_BUFFER_BYTES = 16000 * 2 * 30    // 手動錄音上限 30 秒 (約 960KB)
+        private const val MIN_SEGMENT_DURATION_MS = 200L               // 最短有效語音時長 (支援 short utterances)
     }
 
+    private val lock = Any()
+    @Volatile
     private var audioRecord: AudioRecord? = null
     private var echoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
     private var recordingJob: Job? = null
-    private val vad = VoiceActivityDetector(sampleRate = sampleRate)
+    private val vad = VoiceActivityDetector(sampleRate = sampleRate, minSpeechDurationMs = MIN_SEGMENT_DURATION_MS)
 
     private val speechBuffer = ByteArrayOutputStream()
     private val preRollBuffer = ByteArray(PRE_ROLL_CAPACITY_BYTES)
@@ -50,6 +58,13 @@ class AudioRecorder(
 
     fun setAutoSegmentEnabled(enabled: Boolean) {
         this.isAutoSegmentEnabled = enabled
+        synchronized(lock) {
+            speechBuffer.reset()
+            preRollHead = 0
+            preRollFilled = 0
+        }
+        vad.reset()
+        onSpeechStatusChanged(false)
     }
 
     /**
@@ -58,6 +73,9 @@ class AudioRecorder(
     fun setHalfDuplexMuted(muted: Boolean) {
         this.isHalfDuplexMuted = muted
         if (muted) {
+            synchronized(lock) {
+                speechBuffer.reset()
+            }
             vad.reset()
             onSpeechStatusChanged(false)
         }
@@ -74,7 +92,7 @@ class AudioRecorder(
 
         try {
             // 使用 VOICE_COMMUNICATION 啟用高通 SM8850 底層硬體回音消除 (AEC)
-            audioRecord = AudioRecord(
+            val record = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 sampleRate,
                 channelConfig,
@@ -82,14 +100,16 @@ class AudioRecorder(
                 bufferSize
             )
 
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            if (record.state != AudioRecord.STATE_INITIALIZED) {
                 Log.e(TAG, "AudioRecord initialization failed")
-                audioRecord = null
+                record.release()
                 return false
             }
 
+            audioRecord = record
+
             // 嘗試綁定硬體 AEC 與噪聲消除
-            val sessionId = audioRecord?.audioSessionId ?: 0
+            val sessionId = record.audioSessionId
             if (AcousticEchoCanceler.isAvailable() && sessionId != 0) {
                 echoCanceler = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
                 Log.i(TAG, "Hardware AcousticEchoCanceler (AEC) enabled on session $sessionId")
@@ -99,19 +119,22 @@ class AudioRecorder(
                 Log.i(TAG, "Hardware NoiseSuppressor enabled on session $sessionId")
             }
 
-            audioRecord?.startRecording()
+            record.startRecording()
             isRecording = true
             vad.reset()
-            synchronized(speechBuffer) { speechBuffer.reset() }
-            preRollHead = 0
-            preRollFilled = 0
+            synchronized(lock) {
+                speechBuffer.reset()
+                preRollHead = 0
+                preRollFilled = 0
+            }
 
             recordingJob = coroutineScope.launch(Dispatchers.IO) {
                 val shortBuffer = ShortArray(1024)
                 val byteBuffer = ByteArray(2048)
 
                 while (isActive && isRecording) {
-                    val readCount = audioRecord?.read(shortBuffer, 0, shortBuffer.size) ?: 0
+                    val currentRecord = audioRecord ?: break
+                    val readCount = currentRecord.read(shortBuffer, 0, shortBuffer.size)
                     if (readCount > 0) {
                         // 若處於半雙工靜音狀態 (AI 正在發言)，直接丟棄避免回音
                         if (isHalfDuplexMuted) {
@@ -128,11 +151,15 @@ class AudioRecorder(
                         ByteBuffer.wrap(byteBuffer).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(shortBuffer, 0, readCount)
                         val bytesLength = readCount * 2
 
-                        // 若關閉自動 VAD，則在錄音期間持續累積音訊，等使用者手動停止或點擊送出時切片
+                        // 若關閉自動 VAD，則在錄音期間持續累積音訊 (受 MAX_MANUAL_BUFFER_BYTES 保護)
                         if (!isAutoSegmentEnabled) {
                             onSpeechStatusChanged(normalizedAmp > 0.15f)
-                            synchronized(speechBuffer) {
+                            val shouldFlush = synchronized(lock) {
                                 speechBuffer.write(byteBuffer, 0, bytesLength)
+                                speechBuffer.size() >= MAX_MANUAL_BUFFER_BYTES
+                            }
+                            if (shouldFlush) {
+                                flushSegment()
                             }
                             continue
                         }
@@ -142,7 +169,7 @@ class AudioRecorder(
                             is VoiceActivityDetector.VadResult.SpeechStarted -> {
                                 onSpeechStatusChanged(true)
                                 // 將前導 300ms 環形緩存拷貝進當前語音段，確保字首音節不丟失
-                                synchronized(speechBuffer) {
+                                synchronized(lock) {
                                     speechBuffer.reset()
                                     if (preRollFilled > 0) {
                                         val tailLen = minOf(preRollFilled, PRE_ROLL_CAPACITY_BYTES - preRollHead)
@@ -156,18 +183,25 @@ class AudioRecorder(
                             }
                             is VoiceActivityDetector.VadResult.SpeechEnded -> {
                                 onSpeechStatusChanged(false)
-                                synchronized(speechBuffer) {
+                                synchronized(lock) {
                                     speechBuffer.write(byteBuffer, 0, bytesLength)
                                 }
                                 flushSegment(vadRes.speechDurationMs)
                             }
+                            is VoiceActivityDetector.VadResult.SpeechDiscarded -> {
+                                onSpeechStatusChanged(false)
+                                synchronized(lock) {
+                                    speechBuffer.reset()
+                                }
+                            }
                             is VoiceActivityDetector.VadResult.None -> {
-                                synchronized(speechBuffer) {
-                                    if (speechBuffer.size() > 0) {
+                                synchronized(lock) {
+                                    if (vad.isInSpeech()) {
                                         // 處於說話中，持續累積
                                         speechBuffer.write(byteBuffer, 0, bytesLength)
                                     } else {
-                                        // 靜音中，維護 300ms 環形緩存
+                                        // 靜音中，清空 speechBuffer，維護 300ms 環形緩存
+                                        speechBuffer.reset()
                                         appendPreRoll(byteBuffer, bytesLength)
                                     }
                                 }
@@ -199,9 +233,10 @@ class AudioRecorder(
 
     fun flushSegment(estimatedDurationMs: Long = 0L) {
         val pcmBytes: ByteArray
-        synchronized(speechBuffer) {
+        synchronized(lock) {
             pcmBytes = speechBuffer.toByteArray()
             speechBuffer.reset()
+            preRollFilled = 0
         }
         if (pcmBytes.isNotEmpty()) {
             val duration = if (estimatedDurationMs > 0) {
@@ -209,12 +244,11 @@ class AudioRecorder(
             } else {
                 (pcmBytes.size / (sampleRate * 2.0) * 1000).toLong()
             }
-            if (duration >= 350) {
+            if (duration >= MIN_SEGMENT_DURATION_MS) {
                 onSegmentReady(pcmBytes, duration)
             }
         }
         vad.reset()
-        preRollFilled = 0
     }
 
     fun stopRecording(flushRemaining: Boolean = false) {
@@ -222,18 +256,26 @@ class AudioRecorder(
         isRecording = false
         recordingJob?.cancel()
         recordingJob = null
+
         if (wasRecording && flushRemaining) {
             flushSegment()
         } else {
-            synchronized(speechBuffer) { speechBuffer.reset() }
+            synchronized(lock) {
+                speechBuffer.reset()
+                preRollFilled = 0
+            }
         }
+
+        val recordToRelease = audioRecord
+        audioRecord = null
+
         try {
-            audioRecord?.stop()
-            audioRecord?.release()
+            recordToRelease?.stop()
+            recordToRelease?.release()
         } catch (e: Exception) {
             Log.w(TAG, "Error stopping AudioRecord", e)
         }
-        audioRecord = null
+
         try {
             echoCanceler?.release()
             noiseSuppressor?.release()

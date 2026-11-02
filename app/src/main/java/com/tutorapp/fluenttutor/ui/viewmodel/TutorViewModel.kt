@@ -382,6 +382,11 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         playGreetingOnScreenEnter()
     }
 
+    fun prepareScenarioById(scenarioId: String) {
+        val scenario = allScenarios.firstOrNull { it.id == scenarioId } ?: initialScenario
+        prepareScenario(scenario)
+    }
+
     fun dismissResultDialog() {
         _uiState.update { it.copy(finalSummary = null) }
     }

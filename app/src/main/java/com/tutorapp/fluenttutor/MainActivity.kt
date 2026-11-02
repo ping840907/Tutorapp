@@ -47,15 +47,25 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = DarkBackground
                 ) {
-                    var currentScreen by rememberSaveable { mutableStateOf(AppScreen.SCENARIO_SELECT) }
+                    var selectedScenarioId by rememberSaveable { mutableStateOf<String?>(null) }
                     val uiState by viewModel.uiState.collectAsState()
                     val lifecycleOwner = LocalLifecycleOwner.current
 
-                    // 生命週期監聽：退到背景時停止收音與播放，節省手機電量
+                    // 若系統回收重建，自動將 viewModel 當前場景校準為已選擇的 scenarioId
+                    LaunchedEffect(selectedScenarioId) {
+                        val scenarioId = selectedScenarioId
+                        if (scenarioId != null && uiState.currentScenario.id != scenarioId) {
+                            viewModel.prepareScenarioById(scenarioId)
+                        }
+                    }
+
+                    // 生命週期監聽：退到背景時停止收音與播放，節省手機電量 (旋轉時不打斷)
                     DisposableEffect(lifecycleOwner) {
                         val observer = LifecycleEventObserver { _, event ->
                             if (event == Lifecycle.Event.ON_STOP) {
-                                viewModel.stopAllAudio()
+                                if (!this@MainActivity.isChangingConfigurations) {
+                                    viewModel.stopAllAudio()
+                                }
                             }
                         }
                         lifecycleOwner.lifecycle.addObserver(observer)
@@ -89,24 +99,21 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    when (currentScreen) {
-                        AppScreen.SCENARIO_SELECT -> {
-                            ScenarioSelectScreen(
-                                scenarios = uiState.availableScenarios,
-                                onSelectScenario = { scenario ->
-                                    viewModel.prepareScenario(scenario)
-                                    currentScreen = AppScreen.CONVERSATION
-                                }
-                            )
-                        }
-
-                        AppScreen.CONVERSATION -> {
-                            ConversationScreen(
-                                uiState = uiState,
-                                onBack = {
-                                    viewModel.stopAllAudio()
-                                    currentScreen = AppScreen.SCENARIO_SELECT
-                                },
+                    if (selectedScenarioId == null) {
+                        ScenarioSelectScreen(
+                            scenarios = uiState.availableScenarios,
+                            onSelectScenario = { scenario ->
+                                viewModel.prepareScenario(scenario)
+                                selectedScenarioId = scenario.id
+                            }
+                        )
+                    } else {
+                        ConversationScreen(
+                            uiState = uiState,
+                            onBack = {
+                                viewModel.stopAllAudio()
+                                selectedScenarioId = null
+                            },
                                 onEnterScreen = {
                                     viewModel.playGreetingOnScreenEnter()
                                 },
@@ -147,4 +154,3 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-}

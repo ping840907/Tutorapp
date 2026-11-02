@@ -48,6 +48,8 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -119,6 +121,9 @@ fun NpcAvatarCard(
     Row(
         modifier = modifier
             .fillMaxWidth()
+            .semantics(mergeDescendants = true) {
+                contentDescription = "$roleName, status: ${interactionState.statusLabel}, emotion: ${emotion.label}"
+            }
             .clip(RoundedCornerShape(20.dp))
             .background(
                 Brush.horizontalGradient(

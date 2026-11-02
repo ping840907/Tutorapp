@@ -7,11 +7,13 @@ import kotlin.math.sqrt
  * 1. 取樣點精確計時 (Sample-Accurate Timing，免疫系統時間抖動與 GC 延遲)
  * 2. 自適應動態噪聲基線跟蹤 (Adaptive Noise Floor Tracking)
  * 3. 雙門檻滯後比較 (Hysteresis Thresholding 避免喘氣/環境突發脈衝誤觸)
+ * 4. 線程安全設計 (@Synchronized 保護所有跨執行緒呼叫)
+ * 5. 支援短單詞 (如 "Yes", "No", "Card", "Iced" 等短答)
  */
 class VoiceActivityDetector(
     private val sampleRate: Int = 16000,
     private val silenceThresholdMs: Long = 650L,   // 斷句判定靜音長度
-    private val minSpeechDurationMs: Long = 400L,  // 有效語音最短長度
+    private val minSpeechDurationMs: Long = 200L,  // 有效語音最短長度 (支援短語音回答)
     private var baseEnergyThreshold: Float = 550f
 ) {
     enum class VadState {
@@ -26,9 +28,13 @@ class VoiceActivityDetector(
     private var speechStartSample: Long = 0L
     private var lastSpeechSample: Long = 0L
 
+    @Synchronized
+    fun isInSpeech(): Boolean = currentState == VadState.IN_SPEECH || currentState == VadState.SPEECH_DETECTED
+
     /**
-     * 計算音訊 Frame 的 RMS 能量
+     * 計算音訊 Frame 的 RMS 能量 (線程安全)
      */
+    @Synchronized
     fun calculateRms(buffer: ShortArray, readSize: Int): Float {
         if (readSize <= 0) return 0f
         var sum = 0.0
@@ -38,7 +44,7 @@ class VoiceActivityDetector(
         }
         val rms = sqrt(sum / readSize).toFloat()
 
-        // 僅在靜音時緩慢跟隨背景噪聲
+        // 僅在靜音時緩慢跟隨背景噪聲，避免把說話能量混入噪聲基線
         if (currentState == VadState.SILENCE) {
             noiseFloor = 0.96f * noiseFloor + 0.04f * rms
             baseEnergyThreshold = (noiseFloor * 2.2f).coerceIn(400f, 2200f)
@@ -47,10 +53,11 @@ class VoiceActivityDetector(
     }
 
     /**
-     * 處理音訊 Frame
+     * 處理音訊 Frame (線程安全)
      * @param rms 當前 Frame 的能量
      * @param frameSamplesCount 當前 Frame 包含的音訊取樣點數
      */
+    @Synchronized
     fun processFrame(rms: Float, frameSamplesCount: Int): VadResult {
         processedSamplesTotal += frameSamplesCount
         val speechEnergyThreshold = baseEnergyThreshold
@@ -58,8 +65,6 @@ class VoiceActivityDetector(
 
         val isAboveSpeech = rms > speechEnergyThreshold
         val isAboveSilence = rms > silenceEnergyThreshold
-
-        val currentMs = (processedSamplesTotal * 1000L) / sampleRate
 
         when (currentState) {
             VadState.SILENCE -> {
@@ -73,14 +78,15 @@ class VoiceActivityDetector(
             VadState.SPEECH_DETECTED -> {
                 if (isAboveSilence) {
                     val speechDurationMs = ((processedSamplesTotal - speechStartSample) * 1000L) / sampleRate
-                    if (speechDurationMs >= 100L) { // 連續 100ms 確認說話
+                    if (speechDurationMs >= 80L) { // 連續 80ms 確認說話
                         currentState = VadState.IN_SPEECH
                     }
                     lastSpeechSample = processedSamplesTotal
                 } else {
                     val elapsedMs = ((processedSamplesTotal - speechStartSample) * 1000L) / sampleRate
-                    if (elapsedMs > 180L) {
+                    if (elapsedMs > 150L) {
                         currentState = VadState.SILENCE
+                        return VadResult.SpeechDiscarded
                     }
                 }
             }
@@ -92,8 +98,10 @@ class VoiceActivityDetector(
                     val totalDurationMs = ((processedSamplesTotal - speechStartSample) * 1000L) / sampleRate
                     if (silenceDurationMs >= silenceThresholdMs) {
                         currentState = VadState.SILENCE
-                        if (totalDurationMs >= minSpeechDurationMs) {
-                            return VadResult.SpeechEnded(totalDurationMs)
+                        return if (totalDurationMs >= minSpeechDurationMs) {
+                            VadResult.SpeechEnded(totalDurationMs)
+                        } else {
+                            VadResult.SpeechDiscarded
                         }
                     }
                 }
@@ -102,6 +110,7 @@ class VoiceActivityDetector(
         return VadResult.None(isVoice = isAboveSilence, rms = rms)
     }
 
+    @Synchronized
     fun reset() {
         currentState = VadState.SILENCE
         processedSamplesTotal = 0L
@@ -112,6 +121,7 @@ class VoiceActivityDetector(
     sealed class VadResult {
         object SpeechStarted : VadResult()
         data class SpeechEnded(val speechDurationMs: Long) : VadResult()
+        object SpeechDiscarded : VadResult()
         data class None(val isVoice: Boolean, val rms: Float) : VadResult()
     }
 }

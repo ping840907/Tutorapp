@@ -12,7 +12,7 @@ class VoiceActivityDetectorTest {
 
     @Before
     fun setUp() {
-        vad = VoiceActivityDetector(silenceThresholdMs = 500L, minSpeechDurationMs = 300L)
+        vad = VoiceActivityDetector(silenceThresholdMs = 500L, minSpeechDurationMs = 200L)
     }
 
     @Test
@@ -36,12 +36,12 @@ class VoiceActivityDetectorTest {
         val resStart = vad.processFrame(rms = 1200f, frameSamplesCount = 160)
         assertTrue(resStart is VoiceActivityDetector.VadResult.SpeechStarted)
 
-        // 3. 持續說話中 (累計 400ms)
-        for (i in 0 until 25) {
+        // 3. 持續說話中 (累計 300ms)
+        for (i in 0 until 20) {
             vad.processFrame(rms = 1400f, frameSamplesCount = 160)
         }
 
-        // 4. 靜音開始並超過 500ms (50 frames * 10ms = 500ms)
+        // 4. 靜音開始並超過 500ms (55 frames * 10ms = 550ms)
         var endedResult: VoiceActivityDetector.VadResult? = null
         for (i in 0 until 55) {
             val res = vad.processFrame(rms = 50f, frameSamplesCount = 160)
@@ -52,5 +52,20 @@ class VoiceActivityDetectorTest {
         }
 
         assertTrue("Should detect SpeechEnded with sample accuracy", endedResult is VoiceActivityDetector.VadResult.SpeechEnded)
+    }
+
+    @Test
+    fun testShortBurstNoiseDiscarded() {
+        // 瞬間脈衝 (僅 20ms) 隨後立即安靜，應判定為 SpeechDiscarded 而非 SpeechEnded
+        vad.processFrame(rms = 1500f, frameSamplesCount = 160)
+        var discarded = false
+        for (i in 0 until 25) {
+            val res = vad.processFrame(rms = 50f, frameSamplesCount = 160)
+            if (res is VoiceActivityDetector.VadResult.SpeechDiscarded) {
+                discarded = true
+                break
+            }
+        }
+        assertTrue("Short burst noise should be discarded", discarded)
     }
 }
