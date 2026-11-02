@@ -6,28 +6,21 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.tutorapp.fluenttutor.audio.AudioPlayer
 import com.tutorapp.fluenttutor.audio.AudioRecorder
-import com.tutorapp.fluenttutor.engine.LfmAudioClient
+import com.tutorapp.fluenttutor.engine.LfmSpeechToSpeechEngine
 import com.tutorapp.fluenttutor.engine.MissionJudgeEngine
-import com.tutorapp.fluenttutor.engine.ondevice.OnDeviceLfmEngine
 import com.tutorapp.fluenttutor.model.ChatMessage
-import com.tutorapp.fluenttutor.model.Language
 import com.tutorapp.fluenttutor.model.MessageSender
 import com.tutorapp.fluenttutor.model.MissionFinalSummary
 import com.tutorapp.fluenttutor.model.MissionGoal
 import com.tutorapp.fluenttutor.model.MissionStatus
 import com.tutorapp.fluenttutor.model.Scenario
 import com.tutorapp.fluenttutor.model.TurnEvaluation
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-
-enum class InferenceEngineMode(val displayName: String, val badge: String) {
-    ON_DEVICE_LOCAL("手機本機推論 (On-Device Local)", "📱 Local Edge"),
-    SMART_SIMULATOR("智慧情境模擬 (Simulator)", "⚡ Fast Sim"),
-    REMOTE_SERVER("外部推論伺服器 (Remote GPU)", "🌐 Cloud/LAN")
-}
 
 data class TutorUiState(
     val currentScenario: Scenario,
@@ -42,12 +35,9 @@ data class TutorUiState(
     val missionStatus: MissionStatus = MissionStatus.IN_PROGRESS,
     val finalSummary: MissionFinalSummary? = null,
     val isProcessing: Boolean = false,
-    val inferenceMode: InferenceEngineMode = InferenceEngineMode.ON_DEVICE_LOCAL,
-    val onDeviceRamMb: Long = 0L,
+    val realRamMb: Long = 0L,
     val lastLatencyMs: Long = 0L,
-    val lfmServerUrl: String = "",
-    val availableScenarios: List<Scenario> = Scenario.getPredefinedScenarios(),
-    val selectedLanguage: Language = Language.ENGLISH
+    val availableScenarios: List<Scenario> = Scenario.getPredefinedEnglishScenarios()
 )
 
 class TutorViewModel(application: Application) : AndroidViewModel(application) {
@@ -56,7 +46,13 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         private const val TAG = "TutorViewModel"
     }
 
-    private val allScenarios = Scenario.getPredefinedScenarios()
+    private data class QueuedAudioSegment(
+        val pcmData: ByteArray,
+        val durationMs: Long,
+        val manualText: String? = null
+    )
+
+    private val allScenarios = Scenario.getPredefinedEnglishScenarios()
     private val initialScenario = allScenarios.first()
 
     private val _uiState = MutableStateFlow(
@@ -68,21 +64,28 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<TutorUiState> = _uiState.asStateFlow()
 
-    private val lfmClient = LfmAudioClient()
-    private val onDeviceEngine = OnDeviceLfmEngine(application)
+    // 雙引擎架構：主 S2S 引擎 + 副抗幻覺判定引擎
+    private val s2sEngine = LfmSpeechToSpeechEngine(application)
     private val judgeEngine = MissionJudgeEngine()
-    private val evaluations = mutableListOf<TurnEvaluation>()
 
+    private val evaluations = mutableListOf<TurnEvaluation>()
+    private val dialogHistory = mutableListOf<Pair<String, String>>()
+    private val audioQueueChannel = Channel<QueuedAudioSegment>(Channel.UNLIMITED)
+
+    // 音訊播放器 (支援 WAV 標頭解析與半雙工保護)
     private val audioPlayer = AudioPlayer(
         context = application,
         onPlaybackStateChanged = { isPlaying ->
             _uiState.update { it.copy(isAiSpeaking = isPlaying) }
+            // 半雙工防回音：當 AI 播放語音時，麥克風自動阻斷自激
+            audioRecorder.setHalfDuplexMuted(isPlaying)
         }
     )
 
+    // 音訊錄音器 (SM8850 硬體 AEC 與自適應 VAD)
     private val audioRecorder = AudioRecorder(
         onSegmentReady = { pcmData, durationMs ->
-            handleAudioSegment(pcmData, durationMs)
+            enqueueAudioSegment(pcmData, durationMs)
         },
         onAmplitudeChanged = { amp ->
             _uiState.update { it.copy(amplitude = amp) }
@@ -93,19 +96,37 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     init {
-        onDeviceEngine.loadLocalModel()
-        initScenario(initialScenario)
+        // 啟動單一序列化佇列處理協程，消除任何並行並發狀態競態
+        startAudioProcessingQueue()
+        // 重設場景 (不在 init 搶播語音)
+        prepareScenario(initialScenario)
     }
 
     /**
-     * 初始化或重設場景
+     * 啟動單線程序列音訊處理管道
      */
-    fun initScenario(scenario: Scenario) {
+    private fun startAudioProcessingQueue() {
+        viewModelScope.launch {
+            for (segment in audioQueueChannel) {
+                processSingleSegment(segment.pcmData, segment.durationMs, segment.manualText)
+            }
+        }
+    }
+
+    private fun enqueueAudioSegment(pcmData: ByteArray, durationMs: Long, manualText: String? = null) {
+        if (_uiState.value.missionStatus != MissionStatus.IN_PROGRESS) return
+        audioQueueChannel.trySend(QueuedAudioSegment(pcmData, durationMs, manualText))
+    }
+
+    /**
+     * 重設與切換場景 (靜態重設，不搶播語音)
+     */
+    fun prepareScenario(scenario: Scenario) {
         audioRecorder.stopRecording()
         audioPlayer.stop()
-        audioPlayer.setLanguage(scenario.language)
 
         evaluations.clear()
+        dialogHistory.clear()
         val resetGoals = scenario.goals.map { it.copy(isCompleted = false) }
 
         _uiState.update {
@@ -115,7 +136,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 messages = listOf(
                     ChatMessage(
                         sender = MessageSender.TUTOR,
-                        text = scenario.aiInitialGreeting
+                        text = scenario.initialGreeting
                     )
                 ),
                 isRecording = false,
@@ -124,26 +145,17 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 offTopicStrikes = 0,
                 missionStatus = MissionStatus.IN_PROGRESS,
                 finalSummary = null,
-                onDeviceRamMb = onDeviceEngine.getMemoryUsageMb()
+                realRamMb = s2sEngine.getRealMemoryUsageMb()
             )
         }
-
-        // 開啟場景時播放 AI 初次招呼語
-        viewModelScope.launch {
-            kotlinx.coroutines.delay(400)
-            audioPlayer.speakText(scenario.aiInitialGreeting)
-        }
     }
 
-    fun selectLanguage(language: Language) {
-        val filtered = allScenarios.filter { it.language == language }
-        val newScenario = filtered.firstOrNull() ?: allScenarios.first()
-        _uiState.update { it.copy(selectedLanguage = language) }
-        initScenario(newScenario)
-    }
-
-    fun setInferenceMode(mode: InferenceEngineMode) {
-        _uiState.update { it.copy(inferenceMode = mode) }
+    /**
+     * 當使用者進入對話畫面時，才主動觸發 AI 初次招呼語
+     */
+    fun playGreetingOnScreenEnter() {
+        val greeting = _uiState.value.currentScenario.initialGreeting
+        audioPlayer.speakText(greeting)
     }
 
     fun toggleRecording() {
@@ -152,12 +164,20 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(isRecording = false) }
         } else {
             if (_uiState.value.missionStatus != MissionStatus.IN_PROGRESS) {
-                // 如果已經結束，先重設
-                initScenario(_uiState.value.currentScenario)
+                prepareScenario(_uiState.value.currentScenario)
             }
-            audioRecorder.startRecording(viewModelScope)
-            _uiState.update { it.copy(isRecording = true) }
+            val started = audioRecorder.startRecording(viewModelScope)
+            if (started) {
+                _uiState.update { it.copy(isRecording = true) }
+            } else {
+                _uiState.update { it.copy(isRecording = false) }
+            }
         }
+    }
+
+    fun onPermissionDenied() {
+        audioRecorder.stopRecording()
+        _uiState.update { it.copy(isRecording = false) }
     }
 
     fun setAutoVAD(enabled: Boolean) {
@@ -166,154 +186,128 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * 處理分段語音或文字
+     * 單一執行緒嚴格序列化處理語音片段
      */
-    private fun handleAudioSegment(pcmData: ByteArray, durationMs: Long, manualText: String? = null) {
+    private suspend fun processSingleSegment(
+        pcmData: ByteArray,
+        durationMs: Long,
+        manualText: String?
+    ) {
         if (_uiState.value.missionStatus != MissionStatus.IN_PROGRESS) return
 
-        val currentScenario = _uiState.value.currentScenario
+        val scenario = _uiState.value.currentScenario
         val currentGoals = _uiState.value.goals
         val turnIndex = evaluations.size
 
-        viewModelScope.launch {
-            _uiState.update { it.copy(isProcessing = true) }
+        _uiState.update { it.copy(isProcessing = true) }
 
-            val replyText: String
-            val recognizedUserText: String
-            val generatedAudioBytes: ByteArray?
-            val latency: Long
+        // 1. 主引擎推論 (LFM3 S2S 音訊特徵與回覆生成)
+        val s2sResult = s2sEngine.processSpeechToSpeech(
+            pcmData = pcmData,
+            durationMs = durationMs,
+            scenario = scenario,
+            turnIndex = turnIndex,
+            manualText = manualText,
+            dialogHistory = dialogHistory
+        )
 
-            when (_uiState.value.inferenceMode) {
-                InferenceEngineMode.ON_DEVICE_LOCAL -> {
-                    // 🌟 100% 手機本機端側離線推論與語音生成 🌟
-                    val onDeviceRes = onDeviceEngine.inferAndGenerateSpeech(
-                        pcmData = pcmData,
-                        durationMs = durationMs,
-                        scenario = currentScenario,
-                        turnIndex = turnIndex,
-                        manualText = manualText
-                    )
-                    replyText = onDeviceRes.replyText
-                    recognizedUserText = onDeviceRes.recognizedUserText
-                    generatedAudioBytes = onDeviceRes.generatedAudioBytes
-                    latency = onDeviceRes.latencyMs
-                    _uiState.update { it.copy(onDeviceRamMb = onDeviceRes.usedRamMb) }
-                }
-                InferenceEngineMode.SMART_SIMULATOR -> {
-                    val simRes = lfmClient.sendAudioSegment(pcmData, durationMs, currentScenario, turnIndex, manualText)
-                    replyText = simRes.replyText
-                    recognizedUserText = simRes.recognizedUserText
-                    generatedAudioBytes = null
-                    latency = simRes.latencyMs
-                }
-                InferenceEngineMode.REMOTE_SERVER -> {
-                    val remoteRes = lfmClient.sendAudioSegment(pcmData, durationMs, currentScenario, turnIndex, manualText)
-                    replyText = remoteRes.replyText
-                    recognizedUserText = remoteRes.recognizedUserText
-                    generatedAudioBytes = remoteRes.audioBytes
-                    latency = remoteRes.latencyMs
-                }
-            }
+        // 2. 副引擎嚴密判定 (防止 2B 模型幻覺)
+        val evaluation = judgeEngine.evaluateTurn(
+            userInput = s2sResult.recognizedText,
+            currentGoals = currentGoals,
+            scenario = scenario,
+            turnIndex = turnIndex,
+            audioDurationMs = durationMs
+        )
+        evaluations.add(evaluation)
+        dialogHistory.add(Pair(s2sResult.recognizedText, s2sResult.replyText))
 
-            // 評判小模型評估此輪對話
-            val evaluation = judgeEngine.evaluateTurn(
-                userInput = recognizedUserText,
-                currentGoals = currentGoals,
-                scenario = currentScenario,
-                turnIndex = turnIndex,
-                audioDurationMs = durationMs
-            )
-            evaluations.add(evaluation)
-
-            // 更新目標清單
-            val updatedGoals = currentGoals.map { goal ->
-                if (evaluation.completedGoalIds.contains(goal.id)) {
-                    goal.copy(isCompleted = true)
-                } else {
-                    goal
-                }
-            }
-
-            // 更新偏離 Strike
-            val newStrikes = if (evaluation.isOffTopic) {
-                _uiState.value.offTopicStrikes + 1
+        // 3. 更新目標完成狀態清單
+        val updatedGoals = currentGoals.map { goal ->
+            if (evaluation.completedGoalIds.contains(goal.id)) {
+                goal.copy(isCompleted = true)
             } else {
-                _uiState.value.offTopicStrikes
+                goal
             }
+        }
 
-            // 判定任務狀態 (PASSED / FAILED / IN_PROGRESS)
-            val newStatus = judgeEngine.checkMissionStatus(
+        // 4. 更新偏離 Strike 計數
+        val newStrikes = if (evaluation.isOffTopic) {
+            _uiState.value.offTopicStrikes + 1
+        } else {
+            _uiState.value.offTopicStrikes
+        }
+
+        // 5. 判定任務整體狀態 (過關 / 失敗 / 進行中)
+        val newStatus = judgeEngine.checkMissionStatus(
+            goals = updatedGoals,
+            offTopicStrikes = newStrikes,
+            totalTurns = evaluations.size,
+            scenario = scenario
+        )
+
+        // 6. 若任務終止，結算成績單
+        val summary = if (newStatus != MissionStatus.IN_PROGRESS) {
+            audioRecorder.stopRecording()
+            judgeEngine.generateFinalSummary(
+                status = newStatus,
                 goals = updatedGoals,
+                evaluations = evaluations,
                 offTopicStrikes = newStrikes,
-                totalTurns = evaluations.size,
-                scenario = currentScenario
+                scenario = scenario
             )
+        } else null
 
-            // 若任務完成或失敗，產生最終結算報告
-            val summary = if (newStatus != MissionStatus.IN_PROGRESS) {
-                audioRecorder.stopRecording()
-                judgeEngine.generateFinalSummary(
-                    status = newStatus,
-                    goals = updatedGoals,
-                    evaluations = evaluations,
-                    offTopicStrikes = newStrikes,
-                    scenario = currentScenario
-                )
-            } else null
+        // 7. 更新對話 UI
+        val userMsg = ChatMessage(
+            sender = MessageSender.USER,
+            text = s2sResult.recognizedText,
+            audioDurationMs = durationMs,
+            isOffTopic = evaluation.isOffTopic,
+            offTopicReason = if (evaluation.isOffTopic) "Off-topic strike ($newStrikes/${scenario.maxOffTopicStrikes})" else null
+        )
 
-            // 更新 UI 訊息佇列
-            val userMsg = ChatMessage(
-                sender = MessageSender.USER,
-                text = recognizedUserText,
-                audioDurationMs = durationMs,
-                isOffTopic = evaluation.isOffTopic,
-                offTopicReason = if (evaluation.isOffTopic) "Off-topic strike ($newStrikes/${currentScenario.maxOffTopicStrikes})" else null
+        val aiMsg = ChatMessage(
+            sender = MessageSender.TUTOR,
+            text = s2sResult.replyText
+        )
+
+        val newMessages = _uiState.value.messages.toMutableList().apply {
+            add(userMsg)
+            add(aiMsg)
+            if (evaluation.isOffTopic) {
+                add(ChatMessage(sender = MessageSender.SYSTEM, text = evaluation.feedback))
+            }
+            if (evaluation.completedGoalIds.isNotEmpty()) {
+                add(ChatMessage(sender = MessageSender.SYSTEM, text = "🎯 Goal accomplished!"))
+            }
+        }
+
+        _uiState.update {
+            it.copy(
+                goals = updatedGoals,
+                messages = newMessages,
+                offTopicStrikes = newStrikes,
+                missionStatus = newStatus,
+                finalSummary = summary,
+                isProcessing = false,
+                realRamMb = s2sResult.realRamMb,
+                lastLatencyMs = s2sResult.latencyMs,
+                isRecording = if (newStatus != MissionStatus.IN_PROGRESS) false else it.isRecording
             )
+        }
 
-            val aiMsg = ChatMessage(
-                sender = MessageSender.TUTOR,
-                text = replyText
-            )
-
-            val updatedMessages = _uiState.value.messages.toMutableList().apply {
-                add(userMsg)
-                add(aiMsg)
-                if (evaluation.isOffTopic) {
-                    add(ChatMessage(sender = MessageSender.SYSTEM, text = evaluation.feedback))
-                }
-                if (evaluation.completedGoalIds.isNotEmpty()) {
-                    add(ChatMessage(sender = MessageSender.SYSTEM, text = "🎯 Goal accomplished!"))
-                }
-            }
-
-            _uiState.update {
-                it.copy(
-                    goals = updatedGoals,
-                    messages = updatedMessages,
-                    offTopicStrikes = newStrikes,
-                    missionStatus = newStatus,
-                    finalSummary = summary,
-                    isProcessing = false,
-                    lastLatencyMs = latency,
-                    isRecording = if (newStatus != MissionStatus.IN_PROGRESS) false else it.isRecording
-                )
-            }
-
-            // 播放生成的語音
-            if (generatedAudioBytes != null && generatedAudioBytes.isNotEmpty()) {
-                audioPlayer.playPcm(generatedAudioBytes)
-            } else {
-                audioPlayer.speakText(replyText)
-            }
+        // 8. 播放生成的音訊 (優先播放主引擎生成的波形，若空則走 TTS)
+        if (s2sResult.audioBytes != null && s2sResult.audioBytes.isNotEmpty()) {
+            audioPlayer.playAudioData(s2sResult.audioBytes)
+        } else {
+            audioPlayer.speakText(s2sResult.replyText)
         }
     }
 
-    /**
-     * 手動發送文字 (模擬發音)
-     */
     fun sendManualText(text: String) {
-        val dummyPcm = ByteArray(16000 * 2) // 模擬 1 秒長度的音訊
-        handleAudioSegment(dummyPcm, 1000L, manualText = text)
+        val dummyPcm = ByteArray(16000 * 2)
+        enqueueAudioSegment(dummyPcm, 1000L, manualText = text)
     }
 
     fun playMessageAudio(message: ChatMessage) {
@@ -321,28 +315,24 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun retryCurrentScenario() {
-        initScenario(_uiState.value.currentScenario)
+        prepareScenario(_uiState.value.currentScenario)
+        playGreetingOnScreenEnter()
     }
 
     fun dismissResultDialog() {
         _uiState.update { it.copy(finalSummary = null) }
     }
 
-    fun updateServerConfig(url: String, apiKey: String, mode: InferenceEngineMode) {
-        lfmClient.serverUrl = url
-        lfmClient.apiKey = apiKey
-        _uiState.update {
-            it.copy(
-                lfmServerUrl = url,
-                inferenceMode = mode
-            )
-        }
+    fun stopAllAudio() {
+        audioRecorder.stopRecording()
+        audioPlayer.stop()
+        _uiState.update { it.copy(isRecording = false, isAiSpeaking = false) }
     }
 
     override fun onCleared() {
         super.onCleared()
         audioRecorder.stopRecording()
         audioPlayer.release()
-        onDeviceEngine.release()
+        s2sEngine.release()
     }
 }

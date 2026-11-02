@@ -1,77 +1,77 @@
-# FluentTutor AI 🎙️ - 即時語音對答情境任務學習 App
+# FluentTutor AI 🎙️ - SM8850 旗艦級端側語音對答情境任務學習 App
 
-> 基於 **LFM3-Audio (Liquid Foundation Model 3 Audio / FLM3 Audio)** 多模態語音模型，結合端側自適應 VAD、分段流式輸入與任務目標判定小模型的 Android 語音學習應用。
+基於 **高通驍龍 8 Elite (Snapdragon 8 Elite / SM8850)** 旗艦晶片算力與記憶體頻寬，採用 **端側雙引擎協同架構 (Dual-Engine Edge Architecture)**：
+- **主推論引擎 (Primary Engine)**：Speech-to-Speech (S2S) 語音流對話生成。
+- **副判定引擎 (Judge & Anti-Hallucination Secondary Engine)**：專責防範 2B 多模態模型幻覺，提供精確的子目標達成狀態機、順序依賴性約束與語意偏離（Strike）審查。
 
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-purple.svg)](https://kotlinlang.org)
 [![Android](https://img.shields.io/badge/Android-SDK%2035-brightgreen.svg)](https://developer.android.com)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose%20M3-blue.svg)](https://developer.android.com/jetpack/compose)
-[![Model](https://img.shields.io/badge/Audio%20Model-LFM3--Audio--2B-orange.svg)](https://liquid.ai)
+[![Chipset](https://img.shields.io/badge/Target%20Chip-Snapdragon%20SM8850-red.svg)](https://qualcomm.com)
 
 ---
 
-## 🌟 核心特色與亮點
+## 🌟 核心架構與改進成果
 
-1. **分段進行語音輸入 (Segmented Audio Input via VAD)**
-   - 透過端側自適應語音活動檢測器（Adaptive Voice Activity Detector），實時監控環境底噪與說話能量。
-   - 用戶說完一句話並停頓 600ms~700ms 時，**自動切片斷句並即時送出**，徹底解決傳統錄音長時間等待與卡頓問題，達到超低延遲回話。
+### 1. 雙引擎協同抗幻覺機制 (Dual-Engine Anti-Hallucination)
+- **核心痛點**：2B Speech-to-Speech 模型擅長自然語音交互，但在執行結構化目標判定時容易產生幻覺 (Hallucination) 或出現寬鬆包含誤判。
+- **解決方案**：
+  - **主引擎 (`LfmSpeechToSpeechEngine`)**：專注 16kHz PCM 音訊分析、多輪上下文狀態追蹤與端側語音波形合成。
+  - **副引擎 (`MissionJudgeEngine`)**：完全獨立運行，採用全詞邊界（Regex Word Boundary）與負向否定詞過濾（例如「no oat milk」不會被誤判為完成點餐），並強制遵守階段順序約束（例如點餐場景必須依序：指定飲品 ➔ 冷熱尺寸 ➔ 結帳付款，防止一句話作弊一次過關）。
 
-2. **目標導向對話任務 (Mission-Driven Scenarios)**
-   - 每個關卡均具備清晰的「任務清單（Sub-goals）」，例如：
-     - **咖啡廳點餐**：點燕麥奶拿鐵 ➔ 指定尺寸與冰熱 ➔ 完成結帳付款。
-     - **飯店櫃檯入住**：報到登記 ➔ 詢問早餐時段與 Wi-Fi 密碼 ➔ 領取房卡致謝。
-     - **日語便利商店 (コンビニ)**：購買便當 ➔ 提出加熱要求 ➔ 溝通塑膠袋與筷子 ➔ 結帳完成。
-     - **日語拉麵店 (ラーメン屋)**：點餐 ➔ 指定麵條硬度（バリカタ・かため）➔ 加點/致謝。
+### 2. 極限榨取 SM8850 旗艦晶片算力與記憶體
+- **Oryon CPU + LPDDR5X (12GB~16GB) 高頻寬優化**：
+  - 零拷貝環形緩存 (Zero-Copy Ring Buffer) 與 80-bin Mel Spectrogram 特徵並行計算。
+  - 即時顯示真實系統指標：即時進程 PSS RAM (MB) 與端側原生延遲 (ms)，徹底清除任何假資料。
 
-3. **打分與過關 / 失敗判定小模型 (Mission Judge Engine)**
-   - **🎉 宣布過關 (Mission Passed)**：當用戶在對話中逐一達成所有關鍵子目標時，系統即刻判定過關，頒發 1~3 顆星級榮譽並給予語音流暢度總結報告。
-   - **❌ 宣告失敗 (Mission Failed)**：
-     - 若用戶連續偏離任務目標（例如在點餐時胡言亂語或聊無關事物），累計達上限次數（3 次 Strikes）即宣告失敗。
-     - 超過最大允許對話輪次仍未達成目標時同樣宣告失敗，並給予針對性的改進指引與重試按鈕。
+### 3. 硬體級防回音 (AEC) 與半雙工保護
+- **解決 AI 聽到自己講話並陷入自我觸發的致命迴圈**：
+  - 音訊錄音來源改用 `MediaRecorder.AudioSource.VOICE_COMMUNICATION`，自動啟用高通晶片硬體級 `AcousticEchoCanceler` (AEC) 與 `NoiseSuppressor`。
+  - 增加半雙工閘控：當 AI 在播放語音時，錄音管線自動靜音（Mute），播放結束後恢復，阻斷麥克風自激。
 
-4. **端側流暢運作的必要組件架構**
-   - **16kHz 16-bit Mono PCM 音訊管線**：原生直通 LFM3-Audio 特徵處理。
-   - **端側 Smart Scenario Simulator 備援**：支援完全無外部 GPU 伺服器的「本機即開即用語音體驗」，即使在飛航模式或無網路環境下亦可完整演練全部對話與評判流程。
-   - **動態音訊波形視覺化 (Dynamic Waveform Visualizer)**：隨著用戶發音與 AI 回覆節奏平滑起伏。
-   - **雙語切換**：以英文對話為主，可一鍵切換日語情境。
+### 4. 解決雜音爆音與音訊播放取樣率混淆
+- 打造專屬 `AudioPlayer`，具備 **智慧 WAV 標頭解析器**（動態識別 16kHz / 22.05kHz / 24kHz / 48kHz 取樣率與聲道），跳過 44-byte RIFF 標頭，杜絕將標頭當作 PCM 播放造成的爆音。
+
+### 5. 單線程序列化佇列 (Sequential Channel Pipeline)
+- 透過 Kotlin `Channel` 確保每一段語音依序排隊處理，杜絕多段語音並發造成的變數覆蓋與目標狀態競爭條件 (Race Condition)。
+
+### 6. 專注深度打磨英語對話任務 (English Focused)
+- 移除日語過渡程式碼與多餘的 server/ 後端腳本，架構純粹簡潔：
+  - **Scenario 1: Coffee Shop Order**（紐約 Bean & Leaf 咖啡廳點燕麥奶拿鐵）
+  - **Scenario 2: Hotel Front Desk**（Grand Hyatt 櫃檯辦理入住手續與詢問設施）
+  - **Scenario 3: Airport Boarding Gate**（甘迺迪國際機場登機手續與座位選擇）
 
 ---
 
-## 🏗️ 系統架構設計
+## 🏗️ 目錄架構
 
 ```
 com.tutorapp.fluenttutor
 ├── audio/
-│   ├── AudioRecorder.kt          // 16kHz PCM 串流錄音與即時切片
-│   ├── VoiceActivityDetector.kt  // 端側 RMS 自適應底噪 VAD 自動斷句
-│   ├── AudioPlayer.kt            // PCM/WAV AudioTrack 播放與系統 TTS 雙引擎
-│   └── WaveformBar.kt            // 動態波形跳動視覺化元件
+│   ├── AudioRecorder.kt          # SM8850 硬體 AEC、300ms 前導緩衝、半雙工保護錄音器
+│   ├── VoiceActivityDetector.kt  # 取樣數精準計時、自適應噪聲基線即時斷句 VAD
+│   └── AudioPlayer.kt            # 智慧 WAV 標頭解析、多取樣率 AudioTrack 播放器
 ├── engine/
-│   ├── LfmAudioClient.kt         // LFM3-Audio (2B) 服務接口 (WebSocket / REST)
-│   ├── MissionJudgeEngine.kt     // 目標達成、流暢度評估與偏離判定小模型
-│   └── SmartScenarioSimulator.kt // 端側多輪情境智慧模擬推論引擎
+│   ├── LfmSpeechToSpeechEngine.kt # 主引擎：SM8850 S2S 語音流對話與波形合成
+│   └── MissionJudgeEngine.kt      # 副引擎：防幻覺目標達成狀態機與偏離懲罰審查
 ├── model/
-│   ├── Scenario.kt               // 場景關卡定義 (英文/日文)
-│   ├── MissionGoal.kt            // 任務目標與過關狀態機
-│   ├── ChatMessage.kt            // 對話訊息實體
-│   └── EvaluationResult.kt       // 回合評估與最終結算成績單
-├── ui/
-│   ├── components/               // 任務進度卡、氣泡、結算彈窗、控制面板
-│   ├── screens/                  // 場景選擇、主對話介面、模型設定
-│   ├── theme/                    // Material 3 深色科技主題
-│   └── viewmodel/                // TutorViewModel 核心狀態機
-└── MainActivity.kt               // 主入口與動態錄音權限管理
+│   ├── Scenario.kt               # 精選英語任務場景
+│   ├── MissionGoal.kt            # 順序約束與否定排除之目標模型
+│   ├── ChatMessage.kt            # 對話實體
+│   └── EvaluationResult.kt       # 成績單與星級評分
+└── ui/
+    ├── screens/
+    │   ├── ScenarioSelectScreen.kt # 關卡任務選擇
+    │   └── ConversationScreen.kt   # 雙引擎即時語音對答主畫面
+    ├── components/                 # 聲波視覺化、目標進度卡、結算彈窗
+    ├── viewmodel/TutorViewModel.kt # 單線程序列化協程處理狀態機
+    └── MainActivity.kt             # 生命週期保護 (退後台停收音) 與動態權限
 ```
 
 ---
 
-## 🚀 快速開始
+## 🧪 驗證與建置
 
-### 需求環境
-- Android Studio Ladybug / Koala 或更新版本
-- JDK 17 或 JDK 21 (推薦 Android Studio 自帶的 JBR)
-- Android SDK 35 (最低支援 Android 8.0 / API 26)
-
-### 本地編譯與運行
 ```bash
 # 執行單元測試
 ./gradlew test
@@ -79,18 +79,4 @@ com.tutorapp.fluenttutor
 # 編譯 Debug APK
 ./gradlew assembleDebug
 ```
-
-### 連接 LFM3-Audio 伺服器
-若您擁有部署好 Liquid AI **LFM3-Audio-2B**（或相容音訊端點）的伺服器：
-1. 點擊右上角「⚙️ 設定」按鈕。
-2. 關閉「啟用端側智慧模擬 (Mock Mode)」。
-3. 輸入您的端點 URL（例如：`http://192.168.1.100:8000/v1/audio/chat`）及可選的 API Key。
-4. 點擊「儲存設定」即可開始與大型語音模型即時對答！
-
----
-
-## 🧪 測試驗證
-
-本專案包含完整的單元測試集：
-- `VoiceActivityDetectorTest`：驗證 RMS 計算精度與靜音時長斷句切片有效性。
-- `MissionJudgeEngineTest`：驗證子目標命中、偏離主題檢測（Strikes）、全部目標達成宣布過關與超次失敗邏輯。
+產出 APK 位於：`app/build/outputs/apk/debug/app-debug.apk`。

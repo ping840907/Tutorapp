@@ -1,6 +1,5 @@
 package com.tutorapp.fluenttutor.engine
 
-import com.tutorapp.fluenttutor.model.Language
 import com.tutorapp.fluenttutor.model.MissionFinalSummary
 import com.tutorapp.fluenttutor.model.MissionGoal
 import com.tutorapp.fluenttutor.model.MissionStatus
@@ -8,26 +7,29 @@ import com.tutorapp.fluenttutor.model.Scenario
 import com.tutorapp.fluenttutor.model.TurnEvaluation
 
 /**
- * 智慧任務目標與偏離判定小模型引擎 (Mission Judge & Evaluation Engine)
- * 負責即時檢驗語音對話內容：
- * 1. 子目標達成判定 (Sub-goal completion)
- * 2. 偏離情境檢測與警告 (Off-topic detection & strikes)
- * 3. 宣布過關 (Mission Passed) 或 宣告失敗 (Mission Failed)
- * 4. 多維度學習評分 (相關度、流暢度、星級評價)
+ * 獨立副判定引擎 (Judge & Anti-Hallucination Secondary Engine)
+ * 專為防止 2B Speech-to-Speech (S2S) 主模型產生任務判定幻覺 (Hallucination) 而設計。
+ * 具備：
+ * 1. 意圖邊界識別 (Regex Boundary Matching，防止 "photo" 誤判成 "hot")
+ * 2. 負向否定句過濾 (Negative Exclusions，防止 "I don't want oat milk" 誤判為達成)
+ * 3. 階段順序依賴性約束 (Sequential Dependency，防止一句話灌水同時完成全部目標)
+ * 4. 嚴密偏離情境審查 (Off-Topic Semantic Auditor，累計 3 次 Strikes 判定任務失敗)
  */
 class MissionJudgeEngine {
 
-    // 偏離情境的黑名單概念庫 (無關主題如遊戲、外星人、無意義字眼等)
-    private val offTopicEnKeywords = listOf(
-        "minecraft", "video game", "play station", "alien", "ufo", "politics", "president",
-        "football match", "homework", "boring", "nonsense", "blablabla", "supermarket"
-    )
-    private val offTopicJaKeywords = listOf(
-        "アニメ", "ゲーム", "宇宙人", "政治", "宿題", "つまらない", "関係ない", "なんだこれ"
-    )
+    companion object {
+        // 明顯偏離英語對話情境的離題詞組庫
+        private val UNRELATED_TOPICS = listOf(
+            Regex("\\b(minecraft|fortnite|playstation|xbox|video\\s*game|gameplay)\\b", RegexOption.IGNORE_CASE),
+            Regex("\\b(alien|ufo|extraterrestrial|space\\s*ship|mars)\\b", RegexOption.IGNORE_CASE),
+            Regex("\\b(election|president|congress|politics|political|senate)\\b", RegexOption.IGNORE_CASE),
+            Regex("\\b(homework|math\\s*test|chemistry|exam|algebra)\\b", RegexOption.IGNORE_CASE),
+            Regex("\\b(blablabla|nonsense|whatever|who\\s*cares|shut\\s*up)\\b", RegexOption.IGNORE_CASE)
+        )
+    }
 
     /**
-     * 評估單一輪次的對話輸入
+     * 獨立評估單輪語音輸入
      */
     fun evaluateTurn(
         userInput: String,
@@ -36,61 +38,55 @@ class MissionJudgeEngine {
         turnIndex: Int,
         audioDurationMs: Long
     ): TurnEvaluation {
-        val cleanInput = userInput.trim().lowercase()
+        val cleanInput = userInput.trim()
 
-        // 1. 檢查是否偏離情境
-        val isOffTopic = checkIsOffTopic(cleanInput, scenario)
+        // 1. 離題審查 (Off-Topic Audit)
+        val isOffTopic = checkOffTopic(cleanInput, scenario)
 
-        // 2. 檢查是否有目標達成
+        // 2. 目標達成嚴密檢驗 (防作弊與順序約束)
         val newlyCompletedGoalIds = mutableListOf<String>()
+
         if (!isOffTopic && cleanInput.isNotBlank()) {
+            val completedOrderIndexMax = currentGoals
+                .filter { it.isCompleted }
+                .maxOfOrNull { it.orderIndex } ?: 0
+
             for (goal in currentGoals) {
                 if (!goal.isCompleted) {
-                    val isMatched = goal.keywords.any { keyword ->
-                        cleanInput.contains(keyword.lowercase())
-                    }
-                    if (isMatched) {
-                        newlyCompletedGoalIds.add(goal.id)
+                    // 順序約束：當前階段只能達成 orderIndex <= completedOrderIndexMax + 1 的目標
+                    if (goal.orderIndex <= completedOrderIndexMax + 1) {
+                        val isExcluded = goal.negativeExclusions.any { it.containsMatchIn(cleanInput) }
+                        if (!isExcluded) {
+                            val isAllPatternsMatched = goal.requiredPatterns.all { pattern ->
+                                pattern.containsMatchIn(cleanInput)
+                            }
+                            if (isAllPatternsMatched) {
+                                newlyCompletedGoalIds.add(goal.id)
+                                // 單輪最多只允許推進一個新階段目標，防止一句話作弊全打勾
+                                break
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // 3. 計算發音與流暢度評分 (0 ~ 100)
+        // 3. 計算發音與語速流暢度評分 (Words Per Minute / 依音訊時長)
         val wordCount = cleanInput.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
         val fluencyScore = calculateFluencyScore(wordCount, audioDurationMs)
 
-        // 4. 計算任務相關度評分 (0 ~ 100)
-        val relevanceScore = if (isOffTopic) {
-            25
-        } else if (newlyCompletedGoalIds.isNotEmpty()) {
-            95
-        } else {
-            75
+        // 4. 計算任務相關度得分
+        val relevanceScore = when {
+            isOffTopic -> 20
+            newlyCompletedGoalIds.isNotEmpty() -> 95
+            cleanInput.length >= 8 -> 80
+            else -> 60
         }
 
         val feedback = when {
-            isOffTopic -> {
-                if (scenario.language == Language.ENGLISH) {
-                    "⚠️ Notice: Your response seems unrelated to the mission! Please stay focused on the scenario."
-                } else {
-                    "⚠️ 警告：会話の内容がミッション目標から離れています。シナリオに集中してください。"
-                }
-            }
-            newlyCompletedGoalIds.isNotEmpty() -> {
-                if (scenario.language == Language.ENGLISH) {
-                    "🎯 Great job! You successfully completed a mission goal!"
-                } else {
-                    "🎯 素晴らしい！目標をひとつ達成しました！"
-                }
-            }
-            else -> {
-                if (scenario.language == Language.ENGLISH) {
-                    "👍 Good response, keep the conversation moving toward the remaining goals!"
-                } else {
-                    "👍 順調です！残りの目標に向けて会話を続けましょう。"
-                }
-            }
+            isOffTopic -> "⚠️ Notice: That seemed completely off-topic! Please focus on your current role in this scenario."
+            newlyCompletedGoalIds.isNotEmpty() -> "🎯 Excellent! You successfully achieved a mission milestone!"
+            else -> "👍 Good response! Continue natural dialogue toward the remaining goal."
         }
 
         return TurnEvaluation(
@@ -105,49 +101,51 @@ class MissionJudgeEngine {
     }
 
     /**
-     * 判斷是否完全偏離情境
+     * 檢查是否完全偏離情境
      */
-    private fun checkIsOffTopic(cleanInput: String, scenario: Scenario): Boolean {
-        if (cleanInput.isBlank()) return false
+    private fun checkOffTopic(input: String, scenario: Scenario): Boolean {
+        if (input.isBlank()) return false
 
-        val offList = if (scenario.language == Language.ENGLISH) offTopicEnKeywords else offTopicJaKeywords
-        val hasOffTopicKeyword = offList.any { cleanInput.contains(it) }
+        // 通用離題庫比對
+        if (UNRELATED_TOPICS.any { it.containsMatchIn(input) }) {
+            return true
+        }
 
-        // 針對特定場景的偏離判定
-        val isDomainUnrelated = when (scenario.id) {
+        // 場景特定領域排斥判定
+        return when (scenario.id) {
             "cafe_latte_en" -> {
-                // 如果在咖啡廳要求買機票或修車
-                cleanInput.contains("flight ticket") || cleanInput.contains("car repair") || cleanInput.contains("hospital")
+                // 在咖啡廳談論修車、買高鐵票、看病
+                val cafeIrrelevant = Regex("\\b(car\\s*repair|mechanic|flight\\s*ticket|hospital|surgery)\\b", RegexOption.IGNORE_CASE)
+                cafeIrrelevant.containsMatchIn(input)
             }
-            "convenience_store_ja" -> {
-                // 如果在便利商店要求做手術或搭高鐵
-                cleanInput.contains("新幹線") || cleanInput.contains("病院") || cleanInput.contains("手術")
+            "hotel_checkin_en" -> {
+                val hotelIrrelevant = Regex("\\b(dentist|tractor|football\\s*stadium|roller\\s*coaster)\\b", RegexOption.IGNORE_CASE)
+                hotelIrrelevant.containsMatchIn(input)
+            }
+            "airport_checkin_en" -> {
+                val airportIrrelevant = Regex("\\b(haircut|swimming\\s*pool|camping\\s*tent)\\b", RegexOption.IGNORE_CASE)
+                airportIrrelevant.containsMatchIn(input)
             }
             else -> false
         }
-
-        return hasOffTopicKeyword || isDomainUnrelated
     }
 
-    /**
-     * 依據字數與說話時長計算流暢度評分 (Words Per Minute / 自然語速區間)
-     */
     private fun calculateFluencyScore(wordCount: Int, durationMs: Long): Int {
-        if (durationMs <= 0) return 80
+        if (durationMs <= 0 || wordCount == 0) return 80
         val durationSec = durationMs / 1000.0
-        val wordsPerSec = wordCount / durationSec.coerceAtLeast(0.5)
+        val wps = wordCount / durationSec.coerceAtLeast(0.4)
 
-        // 正常英語口語大約每秒 2~3 個單詞 (120~180 WPM)
+        // 英語自然口語速度約 2.0 ~ 3.2 words/sec (120~190 WPM)
         return when {
-            wordsPerSec in 1.5..3.5 -> 95
-            wordsPerSec in 0.8..4.2 -> 85
-            wordsPerSec < 0.8 -> 70
+            wps in 1.8..3.5 -> 95
+            wps in 1.0..4.5 -> 85
+            wps < 1.0 -> 72
             else -> 75
         }
     }
 
     /**
-     * 綜合判定當前任務狀態 (進行中 / 成功過關 / 任務失敗)
+     * 綜合判定過關與失敗狀態
      */
     fun checkMissionStatus(
         goals: List<MissionGoal>,
@@ -155,10 +153,10 @@ class MissionJudgeEngine {
         totalTurns: Int,
         scenario: Scenario
     ): MissionStatus {
-        val allGoalsCompleted = goals.all { it.isCompleted }
+        val allCompleted = goals.all { it.isCompleted }
 
         return when {
-            allGoalsCompleted -> MissionStatus.PASSED
+            allCompleted -> MissionStatus.PASSED
             offTopicStrikes >= scenario.maxOffTopicStrikes -> MissionStatus.FAILED
             totalTurns >= scenario.maxTurns -> MissionStatus.FAILED
             else -> MissionStatus.IN_PROGRESS
@@ -166,7 +164,7 @@ class MissionJudgeEngine {
     }
 
     /**
-     * 計算最終任務總結報告 (評分、星星、反饋建議)
+     * 結算最終成績單
      */
     fun generateFinalSummary(
         status: MissionStatus,
@@ -183,9 +181,10 @@ class MissionJudgeEngine {
 
         val baseScore = (avgFluency * 0.4 + avgRelevance * 0.6).toInt()
         val penalty = offTopicStrikes * 15
+
         val finalScore = when (status) {
-            MissionStatus.PASSED -> (baseScore - penalty).coerceIn(60, 100)
-            MissionStatus.FAILED -> (baseScore - penalty - 30).coerceIn(10, 59)
+            MissionStatus.PASSED -> (baseScore - penalty).coerceIn(65, 100)
+            MissionStatus.FAILED -> (baseScore - penalty - 25).coerceIn(10, 59)
             MissionStatus.IN_PROGRESS -> baseScore
         }
 
@@ -196,28 +195,15 @@ class MissionJudgeEngine {
             else -> 0
         }
 
-        val isEnglish = scenario.language == Language.ENGLISH
         val summaryFeedback = when (status) {
             MissionStatus.PASSED -> {
-                if (isEnglish) {
-                    "🎉 Mission Passed! You communicated clearly and fulfilled all required goals with natural expressions!"
-                } else {
-                    "🎉 ミッション合格！目標をすべて達成し、自然な日本語でスムーズに会話できました！"
-                }
+                "🎉 MISSION ACCOMPLISHED! You handled all scenario tasks fluently and communicated naturally like a native speaker!"
             }
             MissionStatus.FAILED -> {
                 if (offTopicStrikes >= scenario.maxOffTopicStrikes) {
-                    if (isEnglish) {
-                        "❌ Mission Failed: Conversation deviated from the scenario goal too many times ($offTopicStrikes strikes)."
-                    } else {
-                        "❌ ミッション失敗：目標から外れた発言が制限回数（$offTopicStrikes 回）を超えました。"
-                    }
+                    "❌ MISSION FAILED: You deviated from the mission goal too many times ($offTopicStrikes strikes)."
                 } else {
-                    if (isEnglish) {
-                        "❌ Mission Failed: Turns exceeded limit before completing all goals."
-                    } else {
-                        "❌ ミッション失敗：制限ターン数以内にすべての目標を達成できませんでした。"
-                    }
+                    "❌ MISSION FAILED: Reached the maximum turn limit (${evaluations.size} turns) before fulfilling all required goals."
                 }
             }
             MissionStatus.IN_PROGRESS -> "Mission in progress."
@@ -225,23 +211,12 @@ class MissionJudgeEngine {
 
         val tips = mutableListOf<String>()
         if (status == MissionStatus.PASSED) {
-            if (isEnglish) {
-                tips.add("✨ Excellent responsiveness and pronunciation timing!")
-                tips.add("💡 Try varying your vocabulary in the next challenge.")
-            } else {
-                tips.add("✨ 的確な相槌とスムーズな受け答えができています！")
-                tips.add("💡 次回は敬語表現や丁寧な言い回しにも挑戦してみましょう。")
-            }
+            tips.add("✨ Excellent cadence and clear acoustic rhythm!")
+            tips.add("💡 Ready to challenge another English scenario?")
         } else {
-            if (isEnglish) {
-                tips.add("🎯 Focus directly on the goal checklist displayed at the top.")
-                tips.add("🗣️ Speak clearly and keep your sentences relevant to the scenario role.")
-                tips.add("🔄 Tap Retry to challenge this scenario again!")
-            } else {
-                tips.add("🎯 画面上部の目標リストを確認しながら発言してみましょう。")
-                tips.add("🗣️ 状況に合った単語を意識して、はっきりと話しましょう。")
-                tips.add("🔄 「もう一度挑戦」をタップしてリトライできます！")
-            }
+            tips.add("🎯 Always keep an eye on the checklist card at the top.")
+            tips.add("🗣️ Give direct, relevant answers to the AI's prompts.")
+            tips.add("🔄 Tap Retry to attempt this mission again!")
         }
 
         return MissionFinalSummary(

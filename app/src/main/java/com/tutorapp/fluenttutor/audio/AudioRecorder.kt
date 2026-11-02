@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,7 +17,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * 低延遲音訊錄製與即時分段切片引擎 (Streaming Audio Recorder with VAD)
+ * 低延遲即時串流音訊錄音器 (SM8850 硬體回音消除與半雙工保護)
  */
 class AudioRecorder(
     private val sampleRate: Int = 16000,
@@ -25,23 +27,42 @@ class AudioRecorder(
 ) {
     companion object {
         private const val TAG = "AudioRecorder"
+        private const val PRE_ROLL_CAPACITY_BYTES = 16000 * 2 * 3 / 10 // 300ms 前導環形緩存
     }
 
     private var audioRecord: AudioRecord? = null
+    private var echoCanceler: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
     private var recordingJob: Job? = null
     private val vad = VoiceActivityDetector(sampleRate = sampleRate)
 
-    private val audioBuffer = ByteArrayOutputStream()
+    private val speechBuffer = ByteArrayOutputStream()
+    private val preRollBuffer = ByteArray(PRE_ROLL_CAPACITY_BYTES)
+    private var preRollHead = 0
+    private var preRollFilled = 0
+
     private var isRecording = false
     private var isAutoSegmentEnabled = true
+    private var isHalfDuplexMuted = false // 當 AI 播放語音時為 true，阻斷麥克風自激
 
     fun setAutoSegmentEnabled(enabled: Boolean) {
         this.isAutoSegmentEnabled = enabled
     }
 
+    /**
+     * 半雙工閘控：當 AI 在講話時設置為 true，忽略麥克風輸入
+     */
+    fun setHalfDuplexMuted(muted: Boolean) {
+        this.isHalfDuplexMuted = muted
+        if (muted) {
+            vad.reset()
+            onSpeechStatusChanged(false)
+        }
+    }
+
     @SuppressLint("MissingPermission")
-    fun startRecording(coroutineScope: CoroutineScope) {
-        if (isRecording) return
+    fun startRecording(coroutineScope: CoroutineScope): Boolean {
+        if (isRecording) return true
 
         val channelConfig = AudioFormat.CHANNEL_IN_MONO
         val audioFormat = AudioFormat.ENCODING_PCM_16BIT
@@ -49,8 +70,9 @@ class AudioRecorder(
         val bufferSize = maxOf(minBufferSize, 2048)
 
         try {
+            // 使用 VOICE_COMMUNICATION 啟用高通 SM8850 底層硬體回音消除 (AEC)
             audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 sampleRate,
                 channelConfig,
                 audioFormat,
@@ -59,13 +81,27 @@ class AudioRecorder(
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                 Log.e(TAG, "AudioRecord initialization failed")
-                return
+                audioRecord = null
+                return false
+            }
+
+            // 嘗試綁定硬體 AEC 與噪聲消除
+            val sessionId = audioRecord?.audioSessionId ?: 0
+            if (AcousticEchoCanceler.isAvailable() && sessionId != 0) {
+                echoCanceler = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
+                Log.i(TAG, "Hardware AcousticEchoCanceler (AEC) enabled on session $sessionId")
+            }
+            if (NoiseSuppressor.isAvailable() && sessionId != 0) {
+                noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
+                Log.i(TAG, "Hardware NoiseSuppressor enabled on session $sessionId")
             }
 
             audioRecord?.startRecording()
             isRecording = true
             vad.reset()
-            audioBuffer.reset()
+            synchronized(speechBuffer) { speechBuffer.reset() }
+            preRollHead = 0
+            preRollFilled = 0
 
             recordingJob = coroutineScope.launch(Dispatchers.IO) {
                 val shortBuffer = ShortArray(1024)
@@ -74,51 +110,88 @@ class AudioRecorder(
                 while (isActive && isRecording) {
                     val readCount = audioRecord?.read(shortBuffer, 0, shortBuffer.size) ?: 0
                     if (readCount > 0) {
-                        // 轉換為 ShortArray 並計算 RMS
-                        val rms = vad.calculateRms(shortBuffer, readCount)
-                        val normalizedAmp = (rms / 3000f).coerceIn(0f, 1f)
-                        onAmplitudeChanged(normalizedAmp)
-
-                        // 寫入當前緩衝區 (轉換成 16-bit PCM Little Endian Bytes)
-                        ByteBuffer.wrap(byteBuffer).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(shortBuffer, 0, readCount)
-                        val bytesLength = readCount * 2
-                        synchronized(audioBuffer) {
-                            audioBuffer.write(byteBuffer, 0, bytesLength)
+                        // 若處於半雙工靜音狀態 (AI 正在發言)，直接丟棄避免回音
+                        if (isHalfDuplexMuted) {
+                            onAmplitudeChanged(0.05f)
+                            continue
                         }
 
-                        // VAD 判斷斷句
-                        if (isAutoSegmentEnabled) {
-                            when (val vadRes = vad.processFrame(rms)) {
-                                is VoiceActivityDetector.VadResult.SpeechStarted -> {
-                                    onSpeechStatusChanged(true)
+                        // 計算 RMS 能量
+                        val rms = vad.calculateRms(shortBuffer, readCount)
+                        val normalizedAmp = (rms / 2800f).coerceIn(0f, 1f)
+                        onAmplitudeChanged(normalizedAmp)
+
+                        // 轉為 PCM bytes
+                        ByteBuffer.wrap(byteBuffer).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(shortBuffer, 0, readCount)
+                        val bytesLength = readCount * 2
+
+                        // VAD 斷句狀態推進
+                        when (val vadRes = vad.processFrame(rms, readCount)) {
+                            is VoiceActivityDetector.VadResult.SpeechStarted -> {
+                                onSpeechStatusChanged(true)
+                                // 將前導 300ms 環形緩存拷貝進當前語音段，確保字首音節不丟失
+                                synchronized(speechBuffer) {
+                                    speechBuffer.reset()
+                                    if (preRollFilled > 0) {
+                                        val tailLen = minOf(preRollFilled, PRE_ROLL_CAPACITY_BYTES - preRollHead)
+                                        speechBuffer.write(preRollBuffer, preRollHead, tailLen)
+                                        if (preRollFilled > tailLen) {
+                                            speechBuffer.write(preRollBuffer, 0, preRollFilled - tailLen)
+                                        }
+                                    }
+                                    speechBuffer.write(byteBuffer, 0, bytesLength)
                                 }
-                                is VoiceActivityDetector.VadResult.SpeechEnded -> {
-                                    onSpeechStatusChanged(false)
-                                    // 觸發分段送出
+                            }
+                            is VoiceActivityDetector.VadResult.SpeechEnded -> {
+                                onSpeechStatusChanged(false)
+                                synchronized(speechBuffer) {
+                                    speechBuffer.write(byteBuffer, 0, bytesLength)
+                                }
+                                if (isAutoSegmentEnabled) {
                                     flushSegment(vadRes.speechDurationMs)
                                 }
-                                is VoiceActivityDetector.VadResult.None -> {
-                                    // 保持狀態
+                            }
+                            is VoiceActivityDetector.VadResult.None -> {
+                                synchronized(speechBuffer) {
+                                    if (speechBuffer.size() > 0) {
+                                        // 處於說話中，持續累積
+                                        speechBuffer.write(byteBuffer, 0, bytesLength)
+                                    } else {
+                                        // 靜音中，維護 300ms 環形緩存
+                                        appendPreRoll(byteBuffer, bytesLength)
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "Error starting AudioRecord", e)
             stopRecording()
+            return false
         }
     }
 
-    /**
-     * 手動結束或強制觸發分段送出
-     */
+    private fun appendPreRoll(bytes: ByteArray, length: Int) {
+        var srcPos = 0
+        var remaining = length
+        while (remaining > 0) {
+            val toWrite = minOf(remaining, PRE_ROLL_CAPACITY_BYTES - preRollHead)
+            System.arraycopy(bytes, srcPos, preRollBuffer, preRollHead, toWrite)
+            preRollHead = (preRollHead + toWrite) % PRE_ROLL_CAPACITY_BYTES
+            preRollFilled = minOf(preRollFilled + toWrite, PRE_ROLL_CAPACITY_BYTES)
+            srcPos += toWrite
+            remaining -= toWrite
+        }
+    }
+
     fun flushSegment(estimatedDurationMs: Long = 0L) {
         val pcmBytes: ByteArray
-        synchronized(audioBuffer) {
-            pcmBytes = audioBuffer.toByteArray()
-            audioBuffer.reset()
+        synchronized(speechBuffer) {
+            pcmBytes = speechBuffer.toByteArray()
+            speechBuffer.reset()
         }
         if (pcmBytes.isNotEmpty()) {
             val duration = if (estimatedDurationMs > 0) {
@@ -126,12 +199,12 @@ class AudioRecorder(
             } else {
                 (pcmBytes.size / (sampleRate * 2.0) * 1000).toLong()
             }
-            // 只有長度大於 250ms 才發送，過濾瞬間雜訊
-            if (duration >= 250) {
+            if (duration >= 350) {
                 onSegmentReady(pcmBytes, duration)
             }
         }
         vad.reset()
+        preRollFilled = 0
     }
 
     fun stopRecording() {
@@ -142,9 +215,17 @@ class AudioRecorder(
             audioRecord?.stop()
             audioRecord?.release()
         } catch (e: Exception) {
-            Log.w(TAG, "Error stopping audioRecord", e)
+            Log.w(TAG, "Error stopping AudioRecord", e)
         }
         audioRecord = null
+        try {
+            echoCanceler?.release()
+            noiseSuppressor?.release()
+        } catch (e: Exception) {
+            // ignore
+        }
+        echoCanceler = null
+        noiseSuppressor = null
         onSpeechStatusChanged(false)
         onAmplitudeChanged(0f)
     }

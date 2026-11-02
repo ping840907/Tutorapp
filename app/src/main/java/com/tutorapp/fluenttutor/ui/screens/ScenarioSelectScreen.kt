@@ -19,15 +19,11 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowForward
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -37,11 +33,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.tutorapp.fluenttutor.model.Language
 import com.tutorapp.fluenttutor.model.Scenario
 import com.tutorapp.fluenttutor.ui.theme.DarkBackground
 import com.tutorapp.fluenttutor.ui.theme.PrimaryBlue
@@ -56,13 +50,8 @@ import com.tutorapp.fluenttutor.ui.theme.TextSecondary
 @Composable
 fun ScenarioSelectScreen(
     scenarios: List<Scenario>,
-    selectedLanguage: Language,
-    onSelectLanguage: (Language) -> Unit,
-    onSelectScenario: (Scenario) -> Unit,
-    onOpenSettings: () -> Unit
+    onSelectScenario: (Scenario) -> Unit
 ) {
-    val filteredScenarios = scenarios.filter { it.language == selectedLanguage }
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -75,18 +64,9 @@ fun ScenarioSelectScreen(
                             color = TextPrimary
                         )
                         Text(
-                            text = "LFM3 Audio Real-Time Voice Scenarios",
+                            text = "SM8850 Flagship • Dual-Engine S2S Learning",
                             style = MaterialTheme.typography.labelSmall,
                             color = SecondaryTeal
-                        )
-                    }
-                },
-                actions = {
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(
-                            imageVector = Icons.Default.Settings,
-                            contentDescription = "Settings",
-                            tint = TextSecondary
                         )
                     }
                 },
@@ -101,38 +81,51 @@ fun ScenarioSelectScreen(
                 .padding(paddingValues)
                 .padding(horizontal = 16.dp)
         ) {
-            // 語言切換 Filter Chips
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // 晶片與架構特點橫幅
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = SurfaceDark)
             ) {
-                Language.values().forEach { lang ->
-                    FilterChip(
-                        selected = selectedLanguage == lang,
-                        onClick = { onSelectLanguage(lang) },
-                        label = {
-                            Text(
-                                text = "${lang.flag} ${lang.displayName}",
-                                fontWeight = if (selectedLanguage == lang) FontWeight.Bold else FontWeight.Normal
-                            )
-                        },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = PrimaryBlue,
-                            selectedLabelColor = Color.White,
-                            containerColor = SurfaceDark,
-                            labelColor = TextSecondary
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(PrimaryBlue.copy(alpha = 0.2f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(text = "⚡", fontSize = 18.sp)
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = "Snapdragon 8 Elite 端側雙推論架構",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = PrimaryBlue
                         )
-                    )
+                        Text(
+                            text = "主引擎 S2S 語音流對話 + 副引擎抗幻覺目標審查與評分",
+                            fontSize = 11.sp,
+                            color = TextSecondary
+                        )
+                    }
                 }
             }
 
+            Spacer(modifier = Modifier.height(16.dp))
+
             Text(
-                text = "請選擇挑戰情境：",
+                text = "請選擇英語實戰對話情境：",
                 style = MaterialTheme.typography.titleMedium,
                 color = TextSecondary,
-                modifier = Modifier.padding(vertical = 8.dp)
+                modifier = Modifier.padding(bottom = 10.dp)
             )
 
             // 場景列表
@@ -140,7 +133,7 @@ fun ScenarioSelectScreen(
                 verticalArrangement = Arrangement.spacedBy(14.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
-                items(filteredScenarios) { scenario ->
+                items(scenarios) { scenario ->
                     ScenarioCard(
                         scenario = scenario,
                         onClick = { onSelectScenario(scenario) }
@@ -173,12 +166,12 @@ fun ScenarioCard(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         modifier = Modifier
-                            .size(38.dp)
+                            .size(40.dp)
                             .clip(CircleShape)
                             .background(PrimaryBlue.copy(alpha = 0.15f)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(text = scenario.language.flag, fontSize = 20.sp)
+                        Text(text = "🇺🇸", fontSize = 20.sp)
                     }
                     Spacer(modifier = Modifier.width(12.dp))
                     Column {
@@ -197,7 +190,7 @@ fun ScenarioCard(
                 }
 
                 Icon(
-                    imageVector = Icons.Default.ArrowForward,
+                    imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                     contentDescription = "Start",
                     tint = PrimaryBlue
                 )
@@ -213,7 +206,7 @@ fun ScenarioCard(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 目標標籤
+            // 目標清單標籤
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically

@@ -1,6 +1,6 @@
 package com.tutorapp.fluenttutor.ui.screens
 
-import androidx.compose.animation.AnimatedVisibility
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,7 +14,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -30,7 +30,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -40,6 +39,7 @@ import com.tutorapp.fluenttutor.ui.components.GoalProgressCard
 import com.tutorapp.fluenttutor.ui.components.MissionResultDialog
 import com.tutorapp.fluenttutor.ui.theme.DarkBackground
 import com.tutorapp.fluenttutor.ui.theme.PrimaryBlue
+import com.tutorapp.fluenttutor.ui.theme.SecondaryTeal
 import com.tutorapp.fluenttutor.ui.theme.SurfaceDark
 import com.tutorapp.fluenttutor.ui.theme.TextMuted
 import com.tutorapp.fluenttutor.ui.theme.TextPrimary
@@ -50,6 +50,7 @@ import com.tutorapp.fluenttutor.ui.viewmodel.TutorUiState
 fun ConversationScreen(
     uiState: TutorUiState,
     onBack: () -> Unit,
+    onEnterScreen: () -> Unit,
     onToggleRecording: () -> Unit,
     onToggleAutoVAD: (Boolean) -> Unit,
     onSendManualText: (String) -> Unit,
@@ -59,7 +60,15 @@ fun ConversationScreen(
 ) {
     val listState = rememberLazyListState()
 
-    // 新訊息自動滾動到底部
+    // 系統實體返回按鍵處理
+    BackHandler(onBack = onBack)
+
+    // 僅在使用者真正進入對話畫面時，才主動觸發 AI 的開場問候語 (修復一啟動就搶講話的 bug)
+    LaunchedEffect(Unit) {
+        onEnterScreen()
+    }
+
+    // 收到新對話訊息時平滑自動滾動
     LaunchedEffect(uiState.messages.size) {
         if (uiState.messages.isNotEmpty()) {
             listState.animateScrollToItem(uiState.messages.size - 1)
@@ -78,16 +87,16 @@ fun ConversationScreen(
                             color = TextPrimary
                         )
                         Text(
-                            text = "${uiState.inferenceMode.badge} • ${if (uiState.lastLatencyMs > 0) "${uiState.lastLatencyMs}ms" else "Ready"} • RAM ${uiState.onDeviceRamMb}MB",
+                            text = "SM8850 S2S Engine • RAM: ${uiState.realRamMb}MB • ${if (uiState.lastLatencyMs > 0) "${uiState.lastLatencyMs}ms" else "Ready"}",
                             style = MaterialTheme.typography.labelSmall,
-                            color = PrimaryBlue
+                            color = SecondaryTeal
                         )
                     }
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
-                            imageVector = Icons.Default.ArrowBack,
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
                             tint = TextPrimary
                         )
@@ -131,7 +140,7 @@ fun ConversationScreen(
             ) {
                 Spacer(modifier = Modifier.height(6.dp))
 
-                // 任務目標與偏離警報卡片
+                // 任務目標進度與偏離 Strike 卡片
                 GoalProgressCard(
                     goals = uiState.goals,
                     offTopicStrikes = uiState.offTopicStrikes,
@@ -140,7 +149,7 @@ fun ConversationScreen(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // 訊息列表
+                // 對話訊息滾動清單
                 LazyColumn(
                     state = listState,
                     modifier = Modifier
@@ -156,15 +165,15 @@ fun ConversationScreen(
                 }
             }
 
-            // 推論中 Loading 指示器
+            // SM8850 S2S 推論中指示器
             if (uiState.isProcessing) {
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 16.dp)
                         .clip(RoundedCornerShape(20.dp))
-                        .background(SurfaceDark.copy(alpha = 0.9f))
-                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .background(SurfaceDark.copy(alpha = 0.95f))
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
                 ) {
                     androidx.compose.foundation.layout.Row(
                         verticalAlignment = Alignment.CenterVertically
@@ -175,10 +184,9 @@ fun ConversationScreen(
                             modifier = Modifier.padding(end = 8.dp).height(16.dp).fillMaxWidth(0.1f)
                         )
                         Text(
-                            text = if (uiState.inferenceMode == com.tutorapp.fluenttutor.ui.viewmodel.InferenceEngineMode.ON_DEVICE_LOCAL)
-                                "手機本機端側 LFM3 語音推論中..."
-                            else "LFM3 Audio Processing...",
+                            text = "SM8850 S2S Speech Generating...",
                             fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
                             color = PrimaryBlue
                         )
                     }
