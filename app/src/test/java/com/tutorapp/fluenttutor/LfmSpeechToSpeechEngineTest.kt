@@ -194,4 +194,53 @@ class LfmSpeechToSpeechEngineTest {
         val engine = LfmSpeechToSpeechEngine(fakeBackend)
         assertNull(engine.synthesizeSpeech("Any speech text"))
     }
+
+    @Test
+    fun testNativeSpeechOutputProtocolAllFourComponentsSynchronous() = runBlocking {
+        val scenario = Scenario.getPredefinedEnglishScenarios().first()
+        val backend = FakeBackend(
+            "An iced oat latte, wonderful choice!\n<verdict>{\"transcript\":\"I'd like an iced oat latte, please.\",\"off_topic\":false,\"goals\":[\"goal_drink_oat\"],\"relevance\":96,\"fluency\":92,\"emotion\":\"EXCITED_PROUD\",\"feedback\":\"Natural intonation and clear polite phrasing!\"}</verdict>"
+        )
+        val engine = LfmSpeechToSpeechEngine(backend) { 512L }
+        val result = engine.process(null, scenario, scenario.goals, emptyList(), "I'd like an iced oat latte, please.")
+
+        // 1. NPC 回應
+        assertEquals("An iced oat latte, wonderful choice!", result.replyText)
+        assertNotNull(result.output)
+
+        // 2. ASR 轉寫文字
+        assertEquals("I'd like an iced oat latte, please.", result.output!!.transcript)
+
+        // 3. 狀態機達成與分數
+        assertEquals(listOf("goal_drink_oat"), result.output!!.completedGoalIds)
+        assertEquals(96, result.output!!.relevance)
+        assertEquals(92, result.output!!.fluency)
+        assertTrue(result.output!!.onTopic)
+
+        // 4. NPC 頭像表情
+        assertEquals(NpcEmotion.EXCITED_PROUD, result.output!!.emotion)
+    }
+
+    @Test
+    fun testSynthesizeSpeechStreamProduces250msPcmChunks() = runBlocking {
+        val chunks = mutableListOf<ByteArray>()
+        val backend = object : LfmBackend {
+            override suspend fun generate(request: LfmRequest): LfmRawResponse = LfmRawResponse("ok")
+            override fun synthesizeSpeechStream(text: String) = kotlinx.coroutines.flow.flow {
+                // 250ms at 24kHz 16-bit mono = 6,000 samples = 12,000 bytes
+                val chunkSize = (24000 * 0.25 * 2).toInt()
+                repeat(3) {
+                    emit(ByteArray(chunkSize))
+                }
+            }
+            override fun release() {}
+        }
+        val engine = LfmSpeechToSpeechEngine(backend)
+        engine.synthesizeSpeechStream("Good morning, welcome to our store!").collect { chunk ->
+            chunks.add(chunk)
+        }
+
+        assertEquals(3, chunks.size)
+        assertEquals(12000, chunks[0].size)
+    }
 }

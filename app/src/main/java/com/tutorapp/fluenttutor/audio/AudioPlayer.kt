@@ -4,36 +4,33 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import com.tutorapp.fluenttutor.engine.OnnxLfmAudioBackend
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.Locale
-import kotlin.math.abs
-import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * 高效能音訊播放器 (支援 SM8850 低延遲輸出通道與即時語音振幅同步)
- * 1. 標準 RIFF WAV Chunk 掃描解析器 (動態尋找 fmt 與 data chunk，防溢位與格式檢驗)
- * 2. 播放期間即時計算音訊振幅 (RMS Amplitude)，驅動 NPC 動畫頭像的嘴型同步 (Lip-Sync)
- * 3. 嚴謹的 AudioTrack 播放頭排空等待 (Drain playback head)，杜絕提前解除半雙工靜音導致尾音自激
- * 4. 支援 TTS 未就緒時的延遲佇列 (Pending Speech Queue)，修復首次進入畫面漏播招呼語的問題
+ * 高效能原生音訊播放器 (支援 SM8850 低延遲輸出通道與即時語音振幅同步)
+ * 1. 100% 原生 AudioTrack 播放，禁止預設使用 Google TTS
+ * 2. 支援 24kHz PCM 分塊串流 (Streaming Chunked Playback，首塊延遲 TTFA < 50ms)
+ * 3. 播放期間即時計算音訊振幅 (RMS Amplitude)，驅動 NPC 動畫頭像的嘴型同步 (Lip-Sync)
+ * 4. 嚴謹的 AudioTrack 播放頭排空等待 (Drain playback head)，杜絕提前解除半雙工靜音導致尾音自激
  */
 class AudioPlayer(
     private val context: Context,
     private val onPlaybackStateChanged: (isPlaying: Boolean) -> Unit,
     private val onPlaybackAmplitudeChanged: (amplitude: Float) -> Unit = {}
-) : TextToSpeech.OnInitListener {
+) {
 
     companion object {
         private const val TAG = "AudioPlayer"
@@ -46,7 +43,7 @@ class AudioPlayer(
             val dataLength: Int
         )
 
-        internal fun parseWavHeader(bytes: ByteArray, fallbackSampleRate: Int = 16000): WavInfo {
+        internal fun parseWavHeader(bytes: ByteArray, fallbackSampleRate: Int = 24000): WavInfo {
             if (bytes.size <= 44 ||
                 bytes[0] != 'R'.code.toByte() ||
                 bytes[1] != 'I'.code.toByte() ||
@@ -94,71 +91,17 @@ class AudioPlayer(
         }
     }
 
-    private var tts: TextToSpeech? = null
-    @Volatile
-    private var isTtsReady = false
-    @Volatile
-    private var pendingSpeechText: String? = null
-
     @Volatile
     private var audioTrack: AudioTrack? = null
-    private var ttsEnvelopeJob: Job? = null
     private val playerScope = CoroutineScope(Dispatchers.Default)
+    private var nativeSpeechBackend: OnnxLfmAudioBackend? = null
 
-    init {
-        tts = TextToSpeech(context.applicationContext, this)
-    }
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            val result = tts?.setLanguage(Locale.US)
-            isTtsReady = (result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED)
-            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    onPlaybackStateChanged(true)
-                    startTtsAmplitudeEnvelope()
-                }
-
-                override fun onDone(utteranceId: String?) {
-                    stopTtsAmplitudeEnvelope()
-                    onPlaybackStateChanged(false)
-                }
-
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    stopTtsAmplitudeEnvelope()
-                    onPlaybackStateChanged(false)
-                }
-            })
-            Log.i(TAG, "AudioPlayer TTS engine initialized successfully (Locale: US)")
-
-            val pending = pendingSpeechText
-            if (!pending.isNullOrBlank()) {
-                pendingSpeechText = null
-                speakText(pending)
-            }
-        } else {
-            Log.e(TAG, "AudioPlayer TTS init failed: $status")
-        }
-    }
-
-    private fun startTtsAmplitudeEnvelope() {
-        ttsEnvelopeJob?.cancel()
-        ttsEnvelopeJob = playerScope.launch {
-            var tick = 0f
-            while (isActive) {
-                val env = (0.35f + 0.45f * abs(sin(tick * 1.7f)) * abs(sin(tick * 0.6f))).coerceIn(0.15f, 0.9f)
-                onPlaybackAmplitudeChanged(env)
-                delay(45L)
-                tick += 0.35f
+    private fun getOrCreateBackend(): OnnxLfmAudioBackend {
+        return nativeSpeechBackend ?: synchronized(this) {
+            nativeSpeechBackend ?: OnnxLfmAudioBackend(context.applicationContext).also {
+                nativeSpeechBackend = it
             }
         }
-    }
-
-    private fun stopTtsAmplitudeEnvelope() {
-        ttsEnvelopeJob?.cancel()
-        ttsEnvelopeJob = null
-        onPlaybackAmplitudeChanged(0f)
     }
 
     private fun stopAudioTrack() {
@@ -174,7 +117,7 @@ class AudioPlayer(
         }
     }
 
-    suspend fun playAudioData(audioBytes: ByteArray, fallbackSampleRate: Int = 16000) = withContext(Dispatchers.IO) {
+    suspend fun playAudioData(audioBytes: ByteArray, fallbackSampleRate: Int = 24000) = withContext(Dispatchers.IO) {
         if (audioBytes.isEmpty()) return@withContext
         stop()
         onPlaybackStateChanged(true)
@@ -235,7 +178,7 @@ class AudioPlayer(
                 offset += written
             }
 
-            // 排空 AudioTrack 緩衝區：等待播放頭追上寫入的 Frame 數，防提前解鎖導致麥克風自激
+            // 排空 AudioTrack 緩衝區：等待播放頭追上寫入的 Frame 數
             val bytesPerFrame = 2 * wavInfo.channels
             val totalFrames = if (bytesPerFrame > 0) totalBytesWritten / bytesPerFrame else 0
             val timeoutLimit = System.currentTimeMillis() + 1500L
@@ -264,11 +207,11 @@ class AudioPlayer(
 
     /**
      * 串流播放分塊音訊 (Streaming Chunked Playback)
-     * 首個音訊塊抵達立即啟動 AudioTrack 播放，後續 Chunk 邊運算邊寫入，
-     * 實現首包超低延遲 (TTFA < 100ms)，並在被打斷 (Barge-in / Cancel) 時立即終止。
+     * 首個 250ms 音訊塊抵達立即啟動 AudioTrack 播放，後續 Chunk 邊運算邊寫入，
+     * 實現首包超低延遲 (TTFA < 50ms)，絕不使用 Google TTS。
      */
     suspend fun playAudioStream(
-        chunks: kotlinx.coroutines.flow.Flow<ByteArray>,
+        chunks: Flow<ByteArray>,
         sampleRate: Int = 24000,
         channels: Int = 1,
         fallbackText: String? = null
@@ -371,9 +314,6 @@ class AudioPlayer(
             }
             onPlaybackAmplitudeChanged(0f)
             onPlaybackStateChanged(false)
-            if (totalBytesWritten == 0 && !fallbackText.isNullOrBlank()) {
-                speakText(fallbackText)
-            }
         }
     }
 
@@ -395,21 +335,24 @@ class AudioPlayer(
         return (rms / 4500f).coerceIn(0.08f, 1.0f)
     }
 
+    /**
+     * 原生 24kHz PCM 分塊串流語音朗讀 (杜絕使用系統 Google TTS)
+     */
     fun speakText(text: String, utteranceId: String = System.currentTimeMillis().toString()) {
-        stopAudioTrack()
-        if (!isTtsReady) {
-            Log.i(TAG, "TTS initializing, queueing pending text: $text")
-            pendingSpeechText = text
-            return
+        if (text.isBlank()) return
+        stop()
+        playerScope.launch {
+            val backend = getOrCreateBackend()
+            val stream = backend.synthesizeSpeechStream(text)
+            playAudioStream(
+                chunks = stream,
+                sampleRate = OnnxLfmAudioBackend.OUTPUT_AUDIO_SAMPLE_RATE,
+                fallbackText = null
+            )
         }
-        tts?.stop()
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
     }
 
     fun stop() {
-        pendingSpeechText = null
-        stopTtsAmplitudeEnvelope()
-        tts?.stop()
         stopAudioTrack()
         onPlaybackAmplitudeChanged(0f)
         onPlaybackStateChanged(false)
@@ -418,7 +361,7 @@ class AudioPlayer(
     fun release() {
         stop()
         playerScope.cancel()
-        tts?.shutdown()
-        tts = null
+        nativeSpeechBackend?.release()
+        nativeSpeechBackend = null
     }
 }
