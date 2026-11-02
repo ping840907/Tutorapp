@@ -243,4 +243,24 @@ class LfmSpeechToSpeechEngineTest {
         assertEquals(3, chunks.size)
         assertEquals(12000, chunks[0].size)
     }
+
+    @Test
+    fun testTokenizerSpecialTokensRoundtrip() {
+        val file = java.io.File("C:/Tutorapp/lfm3_audio/tokenizer.json")
+        if (!file.exists()) return
+
+        val tokenizer = com.tutorapp.fluenttutor.engine.Lfm3Tokenizer(file)
+        val prompt = "<|startoftext|><|im_start|>system\nYou are Barista Sarah.<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n"
+        val tokens = tokenizer.encode(prompt)
+        assertTrue(tokens.isNotEmpty())
+        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.START_OF_TEXT_ID))
+        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.IM_START_ID))
+        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.AUDIO_START_ID))
+        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.AUDIO_ID))
+        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.IM_END_ID))
+
+        val decoded = tokenizer.decode(tokens.toList())
+        assertTrue(decoded.contains("Barista Sarah"))
+        assertTrue(decoded.contains("<|im_start|>"))
+    }
 }
