@@ -10,9 +10,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -78,6 +83,8 @@ fun AudioControlPanel(
     Column(
         modifier = modifier
             .fillMaxWidth()
+            .navigationBarsPadding()
+            .imePadding()
             .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
             .background(SurfaceDark)
             .padding(horizontal = 16.dp, vertical = 12.dp),
@@ -206,9 +213,18 @@ fun AudioControlPanel(
                 OutlinedTextField(
                     value = textInput,
                     onValueChange = { textInput = it },
-                    placeholder = { Text("模擬或輸入發音內容...", fontSize = 13.sp, color = TextMuted) },
+                    placeholder = { Text("輸入發音或對話內容...", fontSize = 13.sp, color = TextMuted) },
                     modifier = Modifier.weight(1f),
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(
+                        onSend = {
+                            if (textInput.isNotBlank()) {
+                                onSendManualText(textInput)
+                                textInput = ""
+                            }
+                        }
+                    ),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = PrimaryBlue,
                         unfocusedBorderColor = SurfaceVariantDark,

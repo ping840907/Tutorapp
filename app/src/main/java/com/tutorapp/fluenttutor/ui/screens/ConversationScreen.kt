@@ -5,9 +5,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -47,7 +49,7 @@ import com.tutorapp.fluenttutor.ui.theme.TextMuted
 import com.tutorapp.fluenttutor.ui.theme.TextPrimary
 import com.tutorapp.fluenttutor.ui.viewmodel.TutorUiState
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 fun ConversationScreen(
     uiState: TutorUiState,
@@ -74,6 +76,14 @@ fun ConversationScreen(
     // 收到新對話訊息時平滑自動滾動
     LaunchedEffect(uiState.messages.size) {
         if (uiState.messages.isNotEmpty()) {
+            listState.animateScrollToItem(uiState.messages.size - 1)
+        }
+    }
+
+    // 軟體鍵盤實時升起時自動滾動至最新訊息
+    val isImeVisible = WindowInsets.isImeVisible
+    LaunchedEffect(isImeVisible) {
+        if (isImeVisible && uiState.messages.isNotEmpty()) {
             listState.animateScrollToItem(uiState.messages.size - 1)
         }
     }
