@@ -70,3 +70,16 @@
 | **Vocoder 解碼** | 未驗證 Codebook 直衝 iSTFT (產生沙沙聲) | 碼簿退化檢查，杜絕隨機相位全頻白噪音 |
 | **NPC 對話與狀態** | 固定罐頭對白模板 ("Sorry, ...") | 角色動態對話生成 + 四合一原子更新 (ASR, Reply, Score, Emotion) |
 | **半雙工互鎖** | 播放白噪音時鎖定麥克風導致卡死 | 手動輸入與打斷時主動 stop 並重置半雙工標記 |
+
+
+---
+
+## 5. 後續修正 (改用 Verbead 已驗證的鏈路)
+
+上述「修復」並未真正解決問題：`OnnxLfmAudioBackend` 自行手刻 LFM3 ONNX 推論迴圈，推論失敗時 `ensureStructuredOutput` /
+`decodeSpokenAudioToTranscript` 會**依音訊長度編造使用者的話** (例如 "I'd like an oat milk latte, please.")，並由
+`generateDynamicInCharacterReply` 套模板回覆，所以 ASR 結果永遠被硬編碼對話蓋掉；神經 vocoder 的輸出仍是雜訊。
+
+最終做法：整套刪除自製後端 (`OnnxLfmAudioBackend` / `Lfm3Tokenizer` / `LiquidCodecVocoder`)，改為
+Qwen3-ASR (sherpa-onnx) → Qwen3.5 (llama.cpp) → 系統 TextToSpeech，與 Verbead 一致。
+使用者的 transcript 一律以 ASR/手動輸入為準 (引擎會覆蓋模型 verdict 內的 transcript)；任何失敗都顯示錯誤，不補對白。

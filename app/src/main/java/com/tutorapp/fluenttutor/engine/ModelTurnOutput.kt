@@ -30,13 +30,14 @@ data class ModelTurnOutput(
 
 /**
  * 模型輸出協議：口說回覆文字之後，附上單一 <verdict>{json}</verdict> 區塊。
- * {"transcript": "...", "off_topic": false, "goals": ["goal_id"], "relevance": 0-100, "fluency": 0-100, "emotion": "HAPPY_ENCOURAGING", "feedback": "..."}
+ * {"off_topic": false, "goals": ["goal_id"], "relevance": 0-100, "fluency": 0-100, "emotion": "HAPPY_ENCOURAGING", "feedback": "..."}
  */
 object ModelOutputParser {
     private val VERDICT = Regex("<verdict>(.*?)</verdict>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
 
     /** 取出 verdict 以外、要念出來的回覆文字 */
-    fun replyOf(raw: String): String = raw.replace(VERDICT, "").trim()
+    fun replyOf(raw: String): String =
+        raw.replace(VERDICT, "").replace(Regex("<verdict>.*", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)), "").trim()
 
     fun parse(raw: String): ModelTurnOutput? {
         val match = VERDICT.find(raw) ?: return null

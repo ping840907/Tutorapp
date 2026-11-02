@@ -1,6 +1,5 @@
 package com.tutorapp.fluenttutor
 
-import com.tutorapp.fluenttutor.audio.AudioPlayer
 import com.tutorapp.fluenttutor.engine.LfmBackend
 import com.tutorapp.fluenttutor.engine.LfmRawResponse
 import com.tutorapp.fluenttutor.engine.LfmRequest
@@ -16,50 +15,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 class LfmSpeechToSpeechEngineTest {
-
-    @Test
-    fun testParseWavHeaderWithExtraRiffChunks() {
-        // 建構包含額外 "LIST" chunk 的 RIFF WAV 測試資料，驗證動態掃描不會誤切 44-byte 偏移
-        val pcmDataSize = 320
-        val extraChunkSize = 16 // "LIST" + 4 bytes size + 8 bytes payload
-        val totalSize = 44 + extraChunkSize + pcmDataSize
-        val buffer = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
-
-        // RIFF header (12 bytes)
-        buffer.put("RIFF".toByteArray(Charsets.US_ASCII))
-        buffer.putInt(totalSize - 8)
-        buffer.put("WAVE".toByteArray(Charsets.US_ASCII))
-
-        // fmt chunk (24 bytes)
-        buffer.put("fmt ".toByteArray(Charsets.US_ASCII))
-        buffer.putInt(16)
-        buffer.putShort(1) // PCM format
-        buffer.putShort(1) // Mono
-        buffer.putInt(24000) // Sample rate 24kHz
-        buffer.putInt(48000) // Byte rate
-        buffer.putShort(2) // Block align
-        buffer.putShort(16) // Bits per sample
-
-        // Extra LIST chunk before data (16 bytes)
-        buffer.put("LIST".toByteArray(Charsets.US_ASCII))
-        buffer.putInt(8)
-        buffer.putLong(0x123456789ABCDEF0L)
-
-        // data chunk (8 + pcmDataSize bytes)
-        buffer.put("data".toByteArray(Charsets.US_ASCII))
-        buffer.putInt(pcmDataSize)
-        repeat(pcmDataSize) { buffer.put(0x11.toByte()) }
-
-        val wavInfo = AudioPlayer.parseWavHeader(buffer.array())
-        assertEquals(24000, wavInfo.sampleRate)
-        assertEquals(1, wavInfo.channels)
-        assertEquals(60, wavInfo.dataOffset)
-        assertEquals(pcmDataSize, wavInfo.dataLength)
-    }
 
     @Test
     fun testNpcInteractionStateAndAvatarMapping() {
@@ -93,27 +50,32 @@ class LfmSpeechToSpeechEngineTest {
         assertEquals(0.8f, speakingState.activeAmplitude, 0.001f)
     }
 
-    private class FakeBackend(private val text: String) : LfmBackend {
+    /** 假後端：userTranscript 模擬 ASR/手動輸入的結果；text 是 LLM 原始輸出 */
+    private class FakeBackend(private val userTranscript: String, private val text: String) : LfmBackend {
         var lastRequest: LfmRequest? = null
+        var generateCalls = 0
         override suspend fun generate(request: LfmRequest): LfmRawResponse {
+            generateCalls++
             lastRequest = request
-            return LfmRawResponse(text, null)
+            return LfmRawResponse(userTranscript, text)
         }
+        override suspend fun generateGreeting(scenario: Scenario) = "unused"
         override fun release() {}
     }
+
+    private val verdict = "<verdict>{\"off_topic\":false,\"goals\":[\"goal_drink_oat\"],\"relevance\":90,\"fluency\":85,\"emotion\":\"EXCITED_PROUD\",\"feedback\":\"Nice\"}</verdict>"
 
     @Test
     fun engineParsesVerdictAndBuildsPromptWithGoals() = runBlocking {
         val scenario = Scenario.getPredefinedEnglishScenarios().first()
-        val backend = FakeBackend(
-            "Got it!\n<verdict>{\"transcript\":\"an oat latte\",\"off_topic\":false,\"goals\":[\"goal_drink_oat\"],\"relevance\":90,\"fluency\":85,\"feedback\":\"\"}</verdict>"
-        )
+        val backend = FakeBackend("an oat latte", "Got it!\n$verdict")
         val engine = LfmSpeechToSpeechEngine(backend) { 123L }
         val result = engine.process(null, scenario, scenario.goals, emptyList(), "an oat latte")
 
         assertEquals("Got it!", result.replyText)
         assertNotNull(result.output)
         assertEquals(listOf("goal_drink_oat"), result.output!!.completedGoalIds)
+        assertEquals(NpcEmotion.EXCITED_PROUD, result.output!!.emotion)
         assertEquals(123L, result.realRamMb)
         val prompt = backend.lastRequest!!.systemPrompt
         assertTrue(prompt.contains("[goal_drink_oat]"))
@@ -121,146 +83,41 @@ class LfmSpeechToSpeechEngineTest {
     }
 
     @Test
-    fun engineFallsBackWhenModelOmitsVerdict() = runBlocking {
+    fun transcriptComesFromAsrNotFromModel() = runBlocking {
         val scenario = Scenario.getPredefinedEnglishScenarios().first()
-        val engine = LfmSpeechToSpeechEngine(FakeBackend("Just chatting")) { 0L }
+        // 模型即使在 verdict 裡偷塞一句 transcript，也必須被 ASR 結果覆蓋
+        val sneaky = "Sure.\n<verdict>{\"transcript\":\"I'd like an oat milk latte, please.\",\"off_topic\":false,\"goals\":[],\"relevance\":50,\"fluency\":50}</verdict>"
+        val engine = LfmSpeechToSpeechEngine(FakeBackend("what time is it", sneaky)) { 0L }
+        val result = engine.process(null, scenario, scenario.goals, emptyList(), null)
+        assertEquals("what time is it", result.userTranscript)
+        assertEquals("what time is it", result.output!!.transcript)
+    }
+
+    @Test
+    fun nothingRecognizedYieldsNoReplyAndNoOutput() = runBlocking {
+        val scenario = Scenario.getPredefinedEnglishScenarios().first()
+        val engine = LfmSpeechToSpeechEngine(FakeBackend("", "")) { 0L }
+        val result = engine.process(ByteArray(3200), scenario, scenario.goals, emptyList(), null)
+        assertEquals("", result.userTranscript)
+        assertEquals("", result.replyText) // 不得有任何預設對白
+        assertNull(result.output)
+    }
+
+    @Test
+    fun engineKeepsReplyWhenModelOmitsVerdict() = runBlocking {
+        val scenario = Scenario.getPredefinedEnglishScenarios().first()
+        val engine = LfmSpeechToSpeechEngine(FakeBackend("hi", "Just chatting")) { 0L }
         val result = engine.process(null, scenario, scenario.goals, emptyList(), "hi")
         assertNull(result.output)
         assertEquals("Just chatting", result.replyText)
     }
 
     @Test
-    fun engineParsesEmotionAndOutputsSynchronously() = runBlocking {
+    fun truncatedVerdictIsNeverSpoken() = runBlocking {
         val scenario = Scenario.getPredefinedEnglishScenarios().first()
-        val backend = FakeBackend(
-            "Certainly!\n<verdict>{\"transcript\":\"an oat latte\",\"off_topic\":false,\"goals\":[\"goal_drink_oat\"],\"relevance\":95,\"fluency\":90,\"emotion\":\"EXCITED_PROUD\",\"feedback\":\"Great choice\"}</verdict>"
-        )
-        val engine = LfmSpeechToSpeechEngine(backend) { 0L }
-        val result = engine.process(null, scenario, scenario.goals, emptyList(), "an oat latte")
-
-        assertNotNull(result.output)
-        assertEquals("Certainly!", result.replyText)
-        assertEquals(listOf("goal_drink_oat"), result.output!!.completedGoalIds)
-        assertEquals(95, result.output!!.relevance)
-        assertEquals(90, result.output!!.fluency)
-        assertEquals(NpcEmotion.EXCITED_PROUD, result.output!!.emotion)
-    }
-
-    @Test
-    fun testSynthesizeSpeechStreamEmitsChunks() = runBlocking {
-        val chunkList = mutableListOf<ByteArray>()
-        val fakeStreamingBackend = object : LfmBackend {
-            override suspend fun generate(request: LfmRequest): LfmRawResponse = LfmRawResponse("ok")
-            override fun synthesizeSpeechStream(text: String) = kotlinx.coroutines.flow.flow {
-                // 模擬 250ms chunks (6000 samples = 12000 bytes)
-                repeat(4) {
-                    emit(ByteArray(12000))
-                }
-            }
-            override fun release() {}
-        }
-        val engine = LfmSpeechToSpeechEngine(fakeStreamingBackend)
-        engine.synthesizeSpeechStream("Hello this is a test").collect { chunk ->
-            chunkList.add(chunk)
-        }
-
-        assertEquals(4, chunkList.size)
-        assertEquals(12000, chunkList[0].size)
-    }
-
-    @Test
-    fun testDynamicGreetingGeneration() {
-        val scenario = Scenario.getPredefinedEnglishScenarios().first()
-        val fakeBackend = object : LfmBackend {
-            override suspend fun generate(request: LfmRequest): LfmRawResponse = LfmRawResponse("ok")
-            override fun generateInitialGreeting(scenario: Scenario): String {
-                return "Good morning! Welcome to Bean & Leaf. What can I get handcrafted for you today?"
-            }
-            override fun release() {}
-        }
-        val engine = LfmSpeechToSpeechEngine(fakeBackend)
-        val greeting = engine.generateGreeting(scenario)
-        assertTrue(greeting.isNotBlank())
-        assertTrue(greeting.contains("Bean & Leaf"))
-    }
-
-    @Test
-    fun testSpeechSynthesisNullWhenNoCodecGenerated() {
-        val fakeBackend = object : LfmBackend {
-            override suspend fun generate(request: LfmRequest): LfmRawResponse = LfmRawResponse("ok")
-            override fun synthesizeSpeech(text: String): ByteArray? = null
-            override fun release() {}
-        }
-        val engine = LfmSpeechToSpeechEngine(fakeBackend)
-        assertNull(engine.synthesizeSpeech("Any speech text"))
-    }
-
-    @Test
-    fun testNativeSpeechOutputProtocolAllFourComponentsSynchronous() = runBlocking {
-        val scenario = Scenario.getPredefinedEnglishScenarios().first()
-        val backend = FakeBackend(
-            "An iced oat latte, wonderful choice!\n<verdict>{\"transcript\":\"I'd like an iced oat latte, please.\",\"off_topic\":false,\"goals\":[\"goal_drink_oat\"],\"relevance\":96,\"fluency\":92,\"emotion\":\"EXCITED_PROUD\",\"feedback\":\"Natural intonation and clear polite phrasing!\"}</verdict>"
-        )
-        val engine = LfmSpeechToSpeechEngine(backend) { 512L }
-        val result = engine.process(null, scenario, scenario.goals, emptyList(), "I'd like an iced oat latte, please.")
-
-        // 1. NPC 回應
-        assertEquals("An iced oat latte, wonderful choice!", result.replyText)
-        assertNotNull(result.output)
-
-        // 2. ASR 轉寫文字
-        assertEquals("I'd like an iced oat latte, please.", result.output!!.transcript)
-
-        // 3. 狀態機達成與分數
-        assertEquals(listOf("goal_drink_oat"), result.output!!.completedGoalIds)
-        assertEquals(96, result.output!!.relevance)
-        assertEquals(92, result.output!!.fluency)
-        assertTrue(result.output!!.onTopic)
-
-        // 4. NPC 頭像表情
-        assertEquals(NpcEmotion.EXCITED_PROUD, result.output!!.emotion)
-    }
-
-    @Test
-    fun testSynthesizeSpeechStreamProduces250msPcmChunks() = runBlocking {
-        val chunks = mutableListOf<ByteArray>()
-        val backend = object : LfmBackend {
-            override suspend fun generate(request: LfmRequest): LfmRawResponse = LfmRawResponse("ok")
-            override fun synthesizeSpeechStream(text: String) = kotlinx.coroutines.flow.flow {
-                // 250ms at 24kHz 16-bit mono = 6,000 samples = 12,000 bytes
-                val chunkSize = (24000 * 0.25 * 2).toInt()
-                repeat(3) {
-                    emit(ByteArray(chunkSize))
-                }
-            }
-            override fun release() {}
-        }
-        val engine = LfmSpeechToSpeechEngine(backend)
-        engine.synthesizeSpeechStream("Good morning, welcome to our store!").collect { chunk ->
-            chunks.add(chunk)
-        }
-
-        assertEquals(3, chunks.size)
-        assertEquals(12000, chunks[0].size)
-    }
-
-    @Test
-    fun testTokenizerSpecialTokensRoundtrip() {
-        val file = java.io.File("C:/Tutorapp/lfm3_audio/tokenizer.json")
-        if (!file.exists()) return
-
-        val tokenizer = com.tutorapp.fluenttutor.engine.Lfm3Tokenizer(file)
-        val prompt = "<|startoftext|><|im_start|>system\nYou are Barista Sarah.<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n"
-        val tokens = tokenizer.encode(prompt)
-        assertTrue(tokens.isNotEmpty())
-        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.START_OF_TEXT_ID))
-        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.IM_START_ID))
-        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.AUDIO_START_ID))
-        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.AUDIO_ID))
-        assertTrue(tokens.contains(com.tutorapp.fluenttutor.engine.Lfm3Tokenizer.IM_END_ID))
-
-        val decoded = tokenizer.decode(tokens.toList())
-        assertTrue(decoded.contains("Barista Sarah"))
-        assertTrue(decoded.contains("<|im_start|>"))
+        val engine = LfmSpeechToSpeechEngine(FakeBackend("hi", "Welcome!\n<verdict>{\"off_topic\":fal")) { 0L }
+        val result = engine.process(null, scenario, scenario.goals, emptyList(), "hi")
+        assertNull(result.output)
+        assertEquals("Welcome!", result.replyText)
     }
 }

@@ -21,7 +21,7 @@ object LfmPromptBuilder {
             - List a goal id in "goals" only if the learner clearly satisfied its criteria in this utterance. Negations or refusals do not satisfy a goal.
             - Never list a DONE goal, and never list a goal whose earlier goals are still PENDING.
             - "off_topic" is true only if the utterance has nothing to do with this scenario.
-            - If you could not understand the learner, set "transcript" to "" and ask them to repeat.
+            - The learner's message is already a transcript of what they said. Judge it as spoken English.
             - "relevance" and "fluency" are integers 0-100 for this utterance.
             - "emotion" specifies your facial emotion for this turn, choose exactly one from:
               * "WELCOMING" (initial friendly greeting)
@@ -31,7 +31,7 @@ object LfmPromptBuilder {
               * "DISAPPOINTED_FAILED" (repeated failures or mission termination)
 
             After your spoken reply, output exactly one final block:
-            <verdict>{"transcript":"<what the learner said>","off_topic":false,"goals":[],"relevance":0,"fluency":0,"emotion":"HAPPY_ENCOURAGING","feedback":"<one short tip in English>"}</verdict>
+            <verdict>{"off_topic":false,"goals":[],"relevance":0,"fluency":0,"emotion":"HAPPY_ENCOURAGING","feedback":"<one short tip in English>"}</verdict>
         """.trimIndent()
     }
 }

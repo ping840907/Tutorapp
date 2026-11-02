@@ -4,21 +4,17 @@ import android.os.Debug
 import com.tutorapp.fluenttutor.model.MissionGoal
 import com.tutorapp.fluenttutor.model.Scenario
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 
 /**
- * 唯一的推論引擎：LFM3-Audio Speech-to-Speech。
- * 同一個模型一次輸出「口說回覆 + 結構化評分/目標判定」，由 [MissionStateMachine] 驗證並記錄，
- * 不再有第二個判定引擎。實際推論由 [LfmBackend] 提供。
+ * 對話引擎：ASR (使用者說了什麼) → LLM (NPC 回覆 + 結構化評分/目標判定)，
+ * 由 [MissionStateMachine] 驗證並記錄。回覆語音由 App 層的系統 TTS 念出。
  */
 class LfmSpeechToSpeechEngine(
     private val backend: LfmBackend,
     private val memoryProbe: () -> Long = { defaultMemoryUsageMb() }
 ) {
     companion object {
-        internal const val FALLBACK_REPLY = "Sorry, I didn't catch that. Could you say it again?"
-
         fun defaultMemoryUsageMb(): Long {
             val memInfo = Debug.MemoryInfo()
             Debug.getMemoryInfo(memInfo)
@@ -27,12 +23,12 @@ class LfmSpeechToSpeechEngine(
     }
 
     class S2SResult(
-        /** 要顯示/念出的 NPC 回覆 */
+        /** 使用者這輪的內容 (ASR 結果或手動輸入)；空字串＝沒聽到 */
+        val userTranscript: String,
+        /** NPC 回覆；沒聽到使用者時為空字串 (不會有任何預設對白) */
         val replyText: String,
-        /** 解析成功的結構化輸出；解析失敗為 null (該回合不計分、不改變任務狀態) */
+        /** 解析成功的結構化輸出；失敗為 null (該回合不計分、不改變任務狀態) */
         val output: ModelTurnOutput?,
-        val audioBytes: ByteArray?,
-        val audioStream: Flow<ByteArray>? = null,
         val latencyMs: Long,
         val realRamMb: Long
     )
@@ -58,25 +54,20 @@ class LfmSpeechToSpeechEngine(
         )
         val raw = backend.generate(request)
 
-        val output = ModelOutputParser.parse(raw.text)
-        // output == null 代表模型沒有依協議輸出 verdict：該回合不計分、不改變任務狀態 (由 ViewModel 處理)
-        val reply = (output?.reply ?: ModelOutputParser.replyOf(raw.text)).ifBlank { FALLBACK_REPLY }
+        // 使用者的話一律以 ASR/手動輸入為準，不採信 LLM 自己寫的 transcript
+        val output = ModelOutputParser.parse(raw.text)?.copy(transcript = raw.userTranscript)
+        val reply = output?.reply ?: LfmTextCleaner.spokenOnly(raw.text)
 
         S2SResult(
+            userTranscript = raw.userTranscript,
             replyText = reply,
             output = output,
-            audioBytes = raw.audioBytes,
-            audioStream = raw.audioStream,
             latencyMs = (System.nanoTime() - startNano) / 1_000_000L,
             realRamMb = memoryProbe()
         )
     }
 
-    fun generateGreeting(scenario: Scenario): String = backend.generateInitialGreeting(scenario)
-
-    fun synthesizeSpeech(text: String): ByteArray? = backend.synthesizeSpeech(text)
-
-    fun synthesizeSpeechStream(text: String): Flow<ByteArray> = backend.synthesizeSpeechStream(text)
+    suspend fun generateGreeting(scenario: Scenario): String = backend.generateGreeting(scenario)
 
     fun release() = backend.release()
 }

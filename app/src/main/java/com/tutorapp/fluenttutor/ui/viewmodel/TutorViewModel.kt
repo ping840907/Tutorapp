@@ -8,7 +8,8 @@ import com.tutorapp.fluenttutor.audio.AudioPlayer
 import com.tutorapp.fluenttutor.audio.AudioRecorder
 import com.tutorapp.fluenttutor.engine.LfmSpeechToSpeechEngine
 import com.tutorapp.fluenttutor.engine.MissionStateMachine
-import com.tutorapp.fluenttutor.engine.OnnxLfmAudioBackend
+import com.tutorapp.fluenttutor.engine.LlamaChatBackend
+import com.tutorapp.fluenttutor.engine.ModelStore
 import com.tutorapp.fluenttutor.model.ChatMessage
 import com.tutorapp.fluenttutor.model.MessageSender
 import com.tutorapp.fluenttutor.model.MissionFinalSummary
@@ -91,8 +92,8 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<TutorUiState> = _uiState.asStateFlow()
 
-    // 單一模型架構：真實 Liquid AI LFM3-Audio ONNX 端側推論引擎 (SM8850 加速)
-    private val s2sEngine = LfmSpeechToSpeechEngine(OnnxLfmAudioBackend(application))
+    // ASR (sherpa-onnx Qwen3-ASR) → LLM (llama.cpp Qwen3.5 GGUF) → 系統 TTS；做法參考 Verbead
+    private val s2sEngine = LfmSpeechToSpeechEngine(LlamaChatBackend(application))
     private var stateMachine = MissionStateMachine(initialScenario)
     private var missionState = stateMachine.initialState()
 
@@ -160,17 +161,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (e: Exception) {
                     // 單一片段失敗不能讓整個處理協程死亡
                     Log.e("TutorViewModel", "Failed to process segment", e)
-                    if (session === s) {
-                        _uiState.update {
-                            it.copy(
-                                isProcessing = false,
-                                messages = it.messages + ChatMessage(
-                                    sender = MessageSender.SYSTEM,
-                                    text = "⚠️ Something went wrong. Please try again."
-                                )
-                            )
-                        }
-                    }
+                    if (session === s) showSystemError(e.message ?: e.toString())
                 } finally {
                     s.pending.decrementAndGet()
                 }
@@ -195,18 +186,11 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         stateMachine = MissionStateMachine(scenario)
         missionState = stateMachine.initialState()
 
-        val dynamicGreeting = s2sEngine.generateGreeting(scenario)
-
         _uiState.update {
             it.copy(
                 currentScenario = scenario,
                 goals = missionState.goals,
-                messages = listOf(
-                    ChatMessage(
-                        sender = MessageSender.TUTOR,
-                        text = dynamicGreeting
-                    )
-                ),
+                messages = emptyList(),
                 isRecording = false,
                 isUserSpeaking = false,
                 isAiSpeaking = false,
@@ -229,21 +213,45 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun playGreetingOnScreenEnter() {
         if (_uiState.value.hasPlayedInitialGreeting) return
-        _uiState.update { it.copy(hasPlayedInitialGreeting = true) }
-        val greeting = _uiState.value.messages.firstOrNull { it.sender == MessageSender.TUTOR }?.text
-            ?: s2sEngine.generateGreeting(_uiState.value.currentScenario)
+        _uiState.update { it.copy(hasPlayedInitialGreeting = true, isProcessing = true) }
+        val s = session
+        val scenario = _uiState.value.currentScenario
         viewModelScope.launch {
-            val audioBytes = s2sEngine.synthesizeSpeech(greeting)
-            if (audioBytes != null && audioBytes.isNotEmpty()) {
-                val stream = s2sEngine.synthesizeSpeechStream(greeting)
-                audioPlayer.playAudioStream(
-                    chunks = stream,
-                    sampleRate = OnnxLfmAudioBackend.OUTPUT_AUDIO_SAMPLE_RATE,
-                    fallbackText = greeting
-                )
-            } else {
+            try {
+                val missing = ModelStore.missingFiles(getApplication())
+                if (missing.isNotEmpty()) {
+                    showSystemError("On-device models are missing. Copy them to:\n" + missing.joinToString("\n"))
+                    return@launch
+                }
+                val greeting = s2sEngine.generateGreeting(scenario)
+                if (session !== s) return@launch
+                if (greeting.isBlank()) {
+                    showSystemError("The model returned an empty greeting.")
+                    return@launch
+                }
+                _uiState.update {
+                    it.copy(
+                        isProcessing = false,
+                        messages = it.messages + ChatMessage(sender = MessageSender.TUTOR, text = greeting),
+                        realRamMb = s2sEngine.getRealMemoryUsageMb()
+                    )
+                }
                 audioPlayer.speakText(greeting)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("TutorViewModel", "Greeting failed", e)
+                if (session === s) showSystemError(e.message ?: e.toString())
             }
+        }
+    }
+
+    private fun showSystemError(message: String) {
+        _uiState.update {
+            it.copy(
+                isProcessing = false,
+                messages = it.messages + ChatMessage(sender = MessageSender.SYSTEM, text = "⚠️ $message")
+            )
         }
     }
 
@@ -295,25 +303,45 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
 
         val output = result.output
 
-        // 2. 模型沒聽清楚或輸出格式錯誤：只回覆，不計回合、不改狀態
-        if (output == null || output.isUnintelligible) {
+        // 2a. ASR 沒有辨識出任何內容：不編造使用者的話或 NPC 回覆，只提示，不計回合
+        if (result.userTranscript.isBlank()) {
             _uiState.update {
                 it.copy(
                     isProcessing = false,
-                    messages = it.messages + ChatMessage(sender = MessageSender.TUTOR, text = result.replyText),
-                    lastEvaluationFeedback = "Didn't catch that — this turn was not counted.",
+                    messages = it.messages + ChatMessage(sender = MessageSender.SYSTEM, text = "🎤 Nothing recognized — please try again."),
+                    lastEvaluationFeedback = "Nothing recognized — this turn was not counted.",
                     realRamMb = result.realRamMb,
                     lastLatencyMs = result.latencyMs
                 )
             }
-            playReply(result)
+            return
+        }
+
+        // 2b. LLM 輸出格式錯誤 (沒有 verdict)：顯示使用者的話與回覆，但不計回合、不改狀態
+        if (output == null) {
+            if (result.replyText.isBlank()) {
+                showSystemError("The model returned an empty reply.")
+                return
+            }
+            _uiState.update {
+                it.copy(
+                    isProcessing = false,
+                    messages = it.messages +
+                        ChatMessage(sender = MessageSender.USER, text = result.userTranscript, audioDurationMs = segment.durationMs) +
+                        ChatMessage(sender = MessageSender.TUTOR, text = result.replyText),
+                    lastEvaluationFeedback = "Model gave no score for this turn — not counted.",
+                    realRamMb = result.realRamMb,
+                    lastLatencyMs = result.latencyMs
+                )
+            }
+            audioPlayer.speakText(result.replyText)
             return
         }
 
         // 3. 狀態機驗證並記錄模型的判定
         val newState = stateMachine.applyTurn(state, output)
         missionState = newState
-        dialogHistory.add(output.transcript to result.replyText)
+        dialogHistory.add(result.userTranscript to result.replyText)
 
         val evaluation = newState.evaluations.last()
         val newStatus = newState.status
@@ -365,24 +393,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         // 7. 播放回覆
-        playReply(result)
-    }
-
-    /** 優先播放分塊串流語音 (TTFA < 100ms)，若無串流則播放完整音訊，最後退回系統 TTS */
-    private suspend fun playReply(result: LfmSpeechToSpeechEngine.S2SResult) {
-        val stream = result.audioStream
-        val audio = result.audioBytes
-        if (stream != null) {
-            audioPlayer.playAudioStream(
-                chunks = stream,
-                sampleRate = OnnxLfmAudioBackend.OUTPUT_AUDIO_SAMPLE_RATE,
-                fallbackText = result.replyText
-            )
-        } else if (audio != null && audio.isNotEmpty()) {
-            audioPlayer.playAudioData(audio)
-        } else {
-            audioPlayer.speakText(result.replyText)
-        }
+        audioPlayer.speakText(result.replyText)
     }
 
     fun sendManualText(text: String) {

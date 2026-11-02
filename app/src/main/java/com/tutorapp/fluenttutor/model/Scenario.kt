@@ -8,7 +8,6 @@ data class Scenario(
     val roleName: String,
     val avatarStyle: NpcAvatarStyle = NpcAvatarStyle.BARISTA_SARAH,
     val systemPrompt: String,
-    val initialGreeting: String,
     val goals: List<MissionGoal>,
     val maxOffTopicStrikes: Int = 3,
     val maxTurns: Int = 10
@@ -27,7 +26,6 @@ data class Scenario(
                     You are Sarah, a warm and efficient barista at Bean & Leaf cafe in Manhattan.
                     Ask for missing order details one at a time: drink, milk choice, size/temperature, then payment method.
                 """.trimIndent(),
-                initialGreeting = "Hi there! Welcome to Bean & Leaf. What can I get started for you today?",
                 goals = listOf(
                     MissionGoal(
                         id = "goal_drink_oat",
@@ -66,7 +64,6 @@ data class Scenario(
                     Acknowledge the reservation, provide room key info (Room 704), and answer guest questions.
                     Breakfast is on the 2nd floor from 6:30 to 10:00 AM; the Wi-Fi network is HyattGuest with no password.
                 """.trimIndent(),
-                initialGreeting = "Good afternoon, welcome to Grand Hyatt. How may I assist you with your stay?",
                 goals = listOf(
                     MissionGoal(
                         id = "goal_hotel_checkin",
@@ -105,7 +102,6 @@ data class Scenario(
                     Keep sentences concise, professional, and friendly. Seats available: 14A (window), 14C (aisle).
                     The flight departs from Gate B22 and boarding begins at 10:15 AM.
                 """.trimIndent(),
-                initialGreeting = "Good morning! Flying with Delta today? May I see your passport and ticket please?",
                 goals = listOf(
                     MissionGoal(
                         id = "goal_flight_info",

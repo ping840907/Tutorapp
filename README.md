@@ -1,9 +1,25 @@
 # FluentTutor AI 🎙️ - SM8850 旗艦級端側語音對答情境任務學習 App
 
-基於 **高通驍龍 8 Elite (Snapdragon 8 Elite / SM8850)** 旗艦晶片，採用 **單一模型端側架構 (Single-Model Edge Architecture)**：
-- **唯一模型 LFM3-Audio**：同一次推論同時輸出口說回覆與結構化判定 (逐字稿、是否離題、達成的目標 id、相關度/流暢度評分、一句回饋)。
-- **任務狀態機 (MissionStateMachine)**：不做任何語意判斷，只驗證模型輸出 (忽略未知 id、強制目標順序、離題 Strike 計數、分數夾在 0~100) 並記錄、推進過關/失敗。
-- **推論後端 (LfmBackend)**：真實 LFM3-Audio 執行期實作此介面即可接入；目前內建 StandInLfmBackend 為**開發替身** (只理解手動輸入文字，純語音會回報聽不清楚)，**尚未接上真實模型**。
+端側英語口說情境任務 App。管線做法參考 [Verbead](https://github.com/ping840907/Verbead) 已在實機驗證的實作：
+
+- **ASR**：sherpa-onnx + Qwen3-ASR (int8)，離線辨識。使用者說的話只來自這裡，辨識不到就顯示「Nothing recognized」，不會補任何預設內容。
+- **對話與評分**：llama.cpp 載入 Qwen3.5 GGUF，生成 NPC 回覆 + `<verdict>{json}</verdict>` (離題 / 達成目標 / 評分 / 表情)。
+- **TTS**：Android `TextToSpeech` (STREAM_MUSIC，設定同 Verbead `TtsSpeaker`)。已移除自製神經 vocoder，那是沙沙雜音的來源。
+- **任務狀態機 (MissionStateMachine)**：只驗證模型輸出並記錄、推進過關/失敗。
+- **不使用** `SpeechRecognizer`、雲端 STT/TTS API；模型缺失或載入失敗時直接把錯誤顯示在對話中，**沒有任何寫死對白**。
+
+## 🔧 首次安裝：準備模型與函式庫
+
+1. 下載 [sherpa-onnx-1.13.8.aar](https://github.com/k2-fsa/sherpa-onnx/releases/tag/v1.13.8) 放到 `app/libs/` (`*.aar` 不進版控；建置時 `alignSherpaAar` 會自動對齊 ONNX Runtime 符號版本，同 Verbead)。
+2. 把模型放到裝置的 `/sdcard/Android/data/com.tutorapp.fluenttutor/files/models/` (目錄結構與 Verbead 相同，可直接複製 Verbead 已下載的)：
+   ```
+   models/qwen3_asr/conv_frontend.onnx
+   models/qwen3_asr/encoder.int8.onnx
+   models/qwen3_asr/decoder.int8.onnx
+   models/qwen3_asr/tokenizer/
+   models/slm/Qwen3.5-2B-Q4_K_M.gguf   # 也接受 4B / 0.8B / 9B
+   ```
+3. 缺檔時進入場景會列出缺少的完整路徑。
 
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-purple.svg)](https://kotlinlang.org)
 [![Android](https://img.shields.io/badge/Android-SDK%2035-brightgreen.svg)](https://developer.android.com)
@@ -65,10 +81,14 @@ com.tutorapp.fluenttutor
 ├── audio/
 │   ├── AudioRecorder.kt          # SM8850 硬體 AEC、300ms 前導緩衝、半雙工保護錄音器
 │   ├── VoiceActivityDetector.kt  # 取樣數精準計時、自適應噪聲基線即時斷句 VAD
-│   └── AudioPlayer.kt            # 智慧 WAV 標頭解析、多取樣率 AudioTrack 播放器
+│   └── AudioPlayer.kt            # 系統 TextToSpeech 播放 (設定同 Verbead TtsSpeaker)
 ├── engine/
-│   ├── LfmSpeechToSpeechEngine.kt # 唯一推論引擎：提示詞 → LfmBackend → 解析 verdict
-│   ├── LfmBackend.kt / LfmPromptBuilder.kt / ModelTurnOutput.kt  # 後端介面、提示詞、輸出協議與解析器`n│   ├── StandInLfmBackend.kt       # 開發替身 (非真實模型)`n│   └── MissionStateMachine.kt     # 任務狀態機：驗證並記錄模型判定
+│   ├── Qwen3AsrEngine.kt          # sherpa-onnx 離線 ASR (同 Verbead)
+│   ├── LlamaChatBackend.kt        # ASR → llama.cpp LLM；失敗即丟例外，無罐頭對白
+│   ├── LfmSpeechToSpeechEngine.kt # 提示詞 → 後端 → 解析 verdict (transcript 以 ASR 為準)
+│   ├── ModelStore.kt              # 模型檔位置與缺檔檢查
+│   ├── LfmBackend.kt / LfmPromptBuilder.kt / ModelTurnOutput.kt
+│   └── MissionStateMachine.kt     # 任務狀態機：驗證並記錄模型判定
 ├── model/
 │   ├── Scenario.kt               # 精選英語任務場景與專屬 NPC 角色設定
 │   ├── NpcAvatarModels.kt        # NPC 造型、互動狀態與情緒表情狀態機定義

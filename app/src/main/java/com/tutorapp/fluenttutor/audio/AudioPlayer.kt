@@ -2,152 +2,150 @@ package com.tutorapp.fluenttutor.audio
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
+import android.media.AudioManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
-import com.tutorapp.fluenttutor.engine.OnnxLfmAudioBackend
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.Locale
-import kotlin.math.sqrt
+import kotlin.math.abs
+import kotlin.math.sin
 
 /**
- * 高效能原生音訊播放器 (支援 SM8850 低延遲輸出通道與即時語音振幅同步)
- * 1. 100% 原生 AudioTrack 播放，禁止預設使用 Google TTS
- * 2. 支援 24kHz PCM 分塊串流 (Streaming Chunked Playback，首塊延遲 TTFA < 50ms)
- * 3. 播放期間即時計算音訊振幅 (RMS Amplitude)，驅動 NPC 動畫頭像的嘴型同步 (Lip-Sync)
- * 4. 嚴謹的 AudioTrack 播放頭排空等待 (Drain playback head)，杜絕提前解除半雙工靜音導致尾音自激
+ * NPC 語音播放器。
+ *
+ * TTS 設定與 Verbead 的 TtsSpeaker 完全一致 (該實作已在實機驗證可正常發聲)：
+ * Android TextToSpeech + STREAM_MUSIC + CONTENT_TYPE_SPEECH。
+ * 不再有自製 vocoder / 神經 codec 路徑 —— 那條路徑是「沙沙雜音」的來源。
+ *
+ * 注意：TextToSpeech.speak() 不會把 PCM 交給 App，所以嘴型振幅是依播放狀態產生的模擬動畫，不是真實音量。
  */
 class AudioPlayer(
-    private val context: Context,
+    context: Context,
     private val onPlaybackStateChanged: (isPlaying: Boolean) -> Unit,
     private val onPlaybackAmplitudeChanged: (amplitude: Float) -> Unit = {}
-) {
+) : TextToSpeech.OnInitListener {
 
     companion object {
         private const val TAG = "AudioPlayer"
+        private const val UTTERANCE_PREFIX = "tutor_tts_"
+    }
 
-        internal data class WavInfo(
-            val sampleRate: Int,
-            val channels: Int,
-            val bitsPerSample: Int,
-            val dataOffset: Int,
-            val dataLength: Int
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(Dispatchers.Default)
+    private var amplitudeJob: Job? = null
+
+    private var tts: TextToSpeech? = TextToSpeech(context.applicationContext, this)
+    @Volatile private var isReady = false
+    @Volatile private var currentUtterance: String? = null
+    private var pendingText: String? = null
+
+    override fun onInit(status: Int) {
+        val engine = tts ?: return
+        if (status != TextToSpeech.SUCCESS) {
+            Log.e(TAG, "TextToSpeech init failed, status=$status")
+            return
+        }
+        var result = engine.setLanguage(Locale.US)
+        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+            result = engine.setLanguage(Locale.ENGLISH)
+        }
+        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+            Log.w(TAG, "No English TTS voice data installed on this device")
+        }
+        engine.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
         )
-
-        internal fun parseWavHeader(bytes: ByteArray, fallbackSampleRate: Int = 24000): WavInfo {
-            if (bytes.size <= 44 ||
-                bytes[0] != 'R'.code.toByte() ||
-                bytes[1] != 'I'.code.toByte() ||
-                bytes[2] != 'F'.code.toByte() ||
-                bytes[3] != 'F'.code.toByte()
-            ) {
-                return WavInfo(fallbackSampleRate, 1, 16, 0, bytes.size)
-            }
-
-            val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-            var sampleRate = fallbackSampleRate
-            var channels = 1
-            var bitsPerSample = 16
-            var dataOffset = 44
-            var dataLength = bytes.size - 44
-
-            var pos = 12 // 跳過 RIFF (4) + size (4) + WAVE (4)
-            while (pos + 8 <= bytes.size) {
-                val chunkId = String(bytes, pos, 4, Charsets.US_ASCII)
-                val chunkSizeLong = bb.getInt(pos + 4).toLong() and 0xFFFFFFFFL
-                val chunkDataStart = pos + 8
-
-                if (chunkSizeLong < 0 || chunkDataStart > bytes.size) break
-
-                when (chunkId) {
-                    "fmt " -> {
-                        if (chunkDataStart + 16 <= bytes.size) {
-                            channels = bb.getShort(chunkDataStart + 2).toInt().coerceIn(1, 2)
-                            sampleRate = bb.getInt(chunkDataStart + 4).coerceIn(8000, 96000)
-                            bitsPerSample = bb.getShort(chunkDataStart + 14).toInt().let { if (it in listOf(8, 16, 24, 32)) it else 16 }
-                        }
-                    }
-                    "data" -> {
-                        dataOffset = chunkDataStart
-                        dataLength = minOf(chunkSizeLong.toInt(), bytes.size - chunkDataStart)
-                        break
-                    }
+        engine.setPitch(1.0f)
+        engine.setSpeechRate(1.0f)
+        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {
+                if (utteranceId != currentUtterance) return
+                mainHandler.post {
+                    onPlaybackStateChanged(true)
+                    startAmplitudeSimulation()
                 }
-                val nextPos = chunkDataStart + chunkSizeLong + (chunkSizeLong and 1L)
-                if (nextPos <= pos || nextPos > bytes.size) break
-                pos = nextPos.toInt()
             }
 
-            return WavInfo(sampleRate, channels, bitsPerSample, dataOffset, dataLength)
+            override fun onDone(utteranceId: String?) = finish(utteranceId)
+
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                Log.w(TAG, "TTS error for $utteranceId")
+                finish(utteranceId)
+            }
+        })
+        isReady = true
+        Log.i(TAG, "TextToSpeech ready, voice=${engine.voice?.name}, locale=${engine.voice?.locale}")
+        pendingText?.let { pendingText = null; speakText(it) }
+    }
+
+    private fun finish(utteranceId: String?) {
+        if (utteranceId != currentUtterance) return // 已被新的 utterance 取代
+        currentUtterance = null
+        mainHandler.post {
+            stopAmplitudeSimulation()
+            onPlaybackStateChanged(false)
         }
     }
 
-    @Volatile
-    private var audioTrack: AudioTrack? = null
-    private val playerScope = CoroutineScope(Dispatchers.Default)
-    private var nativeSpeechBackend: OnnxLfmAudioBackend? = null
-
-    private var textToSpeech: TextToSpeech? = null
-    @Volatile private var isTtsReady = false
-    private var amplitudeJob: Job? = null
-
-    init {
-        try {
-            textToSpeech = TextToSpeech(context.applicationContext) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    val tts = textToSpeech
-                    if (tts != null) {
-                        tts.language = Locale.US
-                        tts.setSpeechRate(1.05f)
-                        tts.setPitch(1.0f)
-                        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                            override fun onStart(utteranceId: String?) {
-                                onPlaybackStateChanged(true)
-                                startAmplitudeSimulation()
-                            }
-                            override fun onDone(utteranceId: String?) {
-                                stopAmplitudeSimulation()
-                                onPlaybackAmplitudeChanged(0f)
-                                onPlaybackStateChanged(false)
-                            }
-                            override fun onError(utteranceId: String?) {
-                                stopAmplitudeSimulation()
-                                onPlaybackAmplitudeChanged(0f)
-                                onPlaybackStateChanged(false)
-                            }
-                        })
-                        isTtsReady = true
-                        Log.i(TAG, "AudioPlayer TTS engine initialized successfully.")
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "TextToSpeech init note: ${e.message}")
+    /** 念出文字 (取代正在播放的內容)。 */
+    fun speakText(text: String) {
+        if (text.isBlank()) return
+        if (!isReady) {
+            pendingText = text
+            return
         }
+        val id = "$UTTERANCE_PREFIX${System.nanoTime()}"
+        currentUtterance = id
+        val params = Bundle().apply {
+            putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
+        }
+        val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
+        if (r != TextToSpeech.SUCCESS) {
+            Log.w(TAG, "speak() failed: $r")
+            finish(id)
+        }
+    }
+
+    fun stop() {
+        pendingText = null
+        val wasPlaying = currentUtterance != null
+        currentUtterance = null
+        runCatching { tts?.stop() }
+        mainHandler.post {
+            stopAmplitudeSimulation()
+            if (wasPlaying) onPlaybackStateChanged(false)
+        }
+    }
+
+    fun release() {
+        stop()
+        runCatching { tts?.shutdown() }
+        tts = null
+        isReady = false
+        scope.cancel()
     }
 
     private fun startAmplitudeSimulation() {
         amplitudeJob?.cancel()
-        amplitudeJob = playerScope.launch {
+        amplitudeJob = scope.launch {
             var phase = 0.0
             while (isActive) {
                 phase += 0.4
-                val base = kotlin.math.abs(kotlin.math.sin(phase)).toFloat()
-                val amp = (0.20f + 0.60f * base).coerceIn(0.08f, 0.90f)
-                onPlaybackAmplitudeChanged(amp)
+                onPlaybackAmplitudeChanged((0.20f + 0.60f * abs(sin(phase)).toFloat()).coerceIn(0.08f, 0.90f))
                 delay(60L)
             }
         }
@@ -157,306 +155,5 @@ class AudioPlayer(
         amplitudeJob?.cancel()
         amplitudeJob = null
         onPlaybackAmplitudeChanged(0f)
-    }
-
-    private fun getOrCreateBackend(): OnnxLfmAudioBackend {
-        return nativeSpeechBackend ?: synchronized(this) {
-            nativeSpeechBackend ?: OnnxLfmAudioBackend(context.applicationContext).also {
-                nativeSpeechBackend = it
-            }
-        }
-    }
-
-    private fun stopAudioTrack() {
-        val track = audioTrack
-        audioTrack = null
-        try {
-            track?.pause()
-            track?.flush()
-            track?.stop()
-            track?.release()
-        } catch (e: Exception) {
-            // ignore
-        }
-    }
-
-    suspend fun playAudioData(audioBytes: ByteArray, fallbackSampleRate: Int = 24000) = withContext(Dispatchers.IO) {
-        if (audioBytes.isEmpty()) return@withContext
-        stop()
-        onPlaybackStateChanged(true)
-
-        var currentTrack: AudioTrack? = null
-        try {
-            val wavInfo = parseWavHeader(audioBytes, fallbackSampleRate)
-            val channelConfig = if (wavInfo.channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
-            val minBufSize = AudioTrack.getMinBufferSize(
-                wavInfo.sampleRate,
-                channelConfig,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-
-            val streamChunkBytes = maxOf((wavInfo.sampleRate * 2 * wavInfo.channels) / 20, 1024) // ~50ms
-            val trackBufferSize = maxOf(minBufSize, streamChunkBytes * 2)
-
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(wavInfo.sampleRate)
-                        .setChannelMask(channelConfig)
-                        .build()
-                )
-                .setBufferSizeInBytes(trackBufferSize)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-
-            currentTrack = track
-            audioTrack = track
-            track.play()
-
-            var offset = wavInfo.dataOffset
-            val endOffset = wavInfo.dataOffset + wavInfo.dataLength
-            var totalBytesWritten = 0
-
-            while (offset < endOffset && isActive) {
-                if (track.state != AudioTrack.STATE_INITIALIZED) break
-                val toWrite = minOf(streamChunkBytes, endOffset - offset)
-                val written = try {
-                    track.write(audioBytes, offset, toWrite)
-                } catch (e: IllegalStateException) {
-                    break
-                }
-                if (written <= 0) break
-
-                totalBytesWritten += written
-                val chunkAmp = computePcmChunkAmplitude(audioBytes, offset, written)
-                onPlaybackAmplitudeChanged(chunkAmp)
-
-                offset += written
-            }
-
-            // 排空 AudioTrack 緩衝區：等待播放頭追上寫入的 Frame 數
-            val bytesPerFrame = 2 * wavInfo.channels
-            val totalFrames = if (bytesPerFrame > 0) totalBytesWritten / bytesPerFrame else 0
-            val timeoutLimit = System.currentTimeMillis() + 1500L
-            while (isActive && track.state == AudioTrack.STATE_INITIALIZED && track.playState == AudioTrack.PLAYSTATE_PLAYING && System.currentTimeMillis() < timeoutLimit) {
-                if (track.playbackHeadPosition >= totalFrames) break
-                delay(20L)
-            }
-        } catch (e: Exception) {
-            if (e !is kotlinx.coroutines.CancellationException && e !is IllegalStateException) {
-                Log.e(TAG, "Error during audio playback", e)
-            }
-        } finally {
-            try {
-                currentTrack?.stop()
-                currentTrack?.release()
-            } catch (e: Exception) {
-                // ignore
-            }
-            if (audioTrack === currentTrack) {
-                audioTrack = null
-            }
-            onPlaybackAmplitudeChanged(0f)
-            onPlaybackStateChanged(false)
-        }
-    }
-
-    /**
-     * 串流播放分塊音訊 (Streaming Chunked Playback)
-     * 首個 250ms 音訊塊抵達立即啟動 AudioTrack 播放，後續 Chunk 邊運算邊寫入，
-     * 實現首包超低延遲 (TTFA < 50ms)，絕不使用 Google TTS。
-     */
-    suspend fun playAudioStream(
-        chunks: Flow<ByteArray>,
-        sampleRate: Int = 24000,
-        channels: Int = 1,
-        fallbackText: String? = null
-    ) = withContext(Dispatchers.IO) {
-        stop()
-        onPlaybackStateChanged(true)
-
-        var currentTrack: AudioTrack? = null
-        var totalBytesWritten = 0
-        val channelConfig = if (channels == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
-        val bytesPerFrame = 2 * channels
-
-        try {
-            val minBufSize = AudioTrack.getMinBufferSize(
-                sampleRate,
-                channelConfig,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-            val streamChunkBytes = maxOf((sampleRate * 2 * channels) / 10, 2048) // ~100ms
-            val trackBufferSize = maxOf(minBufSize * 2, streamChunkBytes * 4)
-
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(channelConfig)
-                        .build()
-                )
-                .setBufferSizeInBytes(trackBufferSize)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-
-            currentTrack = track
-            audioTrack = track
-            track.play()
-
-            chunks.collect { chunk ->
-                if (!isActive) return@collect
-                if (chunk.isEmpty()) return@collect
-
-                // 若 Chunk 包含 RIFF 檔頭則自動跳過檔頭
-                val (offset, length) = if (chunk.size >= 44 &&
-                    chunk[0] == 'R'.code.toByte() && chunk[1] == 'I'.code.toByte() &&
-                    chunk[2] == 'F'.code.toByte() && chunk[3] == 'F'.code.toByte()
-                ) {
-                    val info = parseWavHeader(chunk, sampleRate)
-                    Pair(info.dataOffset, info.dataLength)
-                } else {
-                    Pair(0, chunk.size)
-                }
-
-                var writtenOffset = offset
-                val endOffset = offset + length
-
-                while (writtenOffset < endOffset && isActive) {
-                    if (track.state != AudioTrack.STATE_INITIALIZED) break
-                    val toWrite = minOf(streamChunkBytes, endOffset - writtenOffset)
-                    val written = try {
-                        track.write(chunk, writtenOffset, toWrite)
-                    } catch (e: IllegalStateException) {
-                        break
-                    }
-                    if (written <= 0) break
-                    totalBytesWritten += written
-
-                    val chunkAmp = computePcmChunkAmplitude(chunk, writtenOffset, written)
-                    onPlaybackAmplitudeChanged(chunkAmp)
-
-                    writtenOffset += written
-                }
-            }
-
-            // 排空 AudioTrack 緩衝區
-            val totalFrames = if (bytesPerFrame > 0) totalBytesWritten / bytesPerFrame else 0
-            val timeoutLimit = System.currentTimeMillis() + 1500L
-            while (isActive && track.state == AudioTrack.STATE_INITIALIZED && track.playState == AudioTrack.PLAYSTATE_PLAYING && System.currentTimeMillis() < timeoutLimit) {
-                if (track.playbackHeadPosition >= totalFrames) break
-                delay(20L)
-            }
-
-            // 若音訊串流為空且提供了 fallbackText，無縫平滑回退至清晰語音
-            if (totalBytesWritten == 0 && !fallbackText.isNullOrBlank()) {
-                withContext(Dispatchers.Main) {
-                    speakText(fallbackText)
-                }
-                return@withContext
-            }
-        } catch (e: Exception) {
-            if (e !is kotlinx.coroutines.CancellationException && e !is IllegalStateException) {
-                Log.e(TAG, "Error during streaming audio playback", e)
-            }
-        } finally {
-            try {
-                currentTrack?.stop()
-                currentTrack?.release()
-            } catch (e: Exception) {
-                // ignore
-            }
-            if (audioTrack === currentTrack) {
-                audioTrack = null
-            }
-            if (textToSpeech?.isSpeaking != true) {
-                onPlaybackAmplitudeChanged(0f)
-                onPlaybackStateChanged(false)
-            }
-        }
-    }
-
-    private fun computePcmChunkAmplitude(bytes: ByteArray, offset: Int, length: Int): Float {
-        val sampleCount = length / 2
-        if (sampleCount <= 0) return 0f
-        var sumSq = 0.0
-        var i = 0
-        while (i < sampleCount) {
-            val byteIdx = offset + i * 2
-            if (byteIdx + 1 >= bytes.size) break
-            val low = bytes[byteIdx].toInt() and 0xFF
-            val high = bytes[byteIdx + 1].toInt()
-            val sample = ((high shl 8) or low).toShort().toDouble()
-            sumSq += sample * sample
-            i++
-        }
-        val rms = sqrt(sumSq / sampleCount).toFloat()
-        return (rms / 4500f).coerceIn(0.08f, 1.0f)
-    }
-
-    /**
-     * 高品質自然語音合成 (自然流暢英語發音，杜絕蜂鳴與沙沙雜訊)
-     */
-    fun speakText(text: String, utteranceId: String = System.currentTimeMillis().toString()) {
-        if (text.isBlank()) return
-        stop()
-
-        val tts = textToSpeech
-        if (tts != null && isTtsReady) {
-            val params = Bundle().apply {
-                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
-            }
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-        } else {
-            // 若尚未就緒，嘗試透過神經串流後端
-            playerScope.launch {
-                val backend = getOrCreateBackend()
-                val stream = backend.synthesizeSpeechStream(text)
-                playAudioStream(
-                    chunks = stream,
-                    sampleRate = OnnxLfmAudioBackend.OUTPUT_AUDIO_SAMPLE_RATE,
-                    fallbackText = null
-                )
-            }
-        }
-    }
-
-    fun stop() {
-        stopAudioTrack()
-        stopAmplitudeSimulation()
-        try {
-            textToSpeech?.stop()
-        } catch (e: Exception) {
-            // ignore
-        }
-        onPlaybackAmplitudeChanged(0f)
-        onPlaybackStateChanged(false)
-    }
-
-    fun release() {
-        stop()
-        playerScope.cancel()
-        try {
-            textToSpeech?.shutdown()
-            textToSpeech = null
-        } catch (e: Exception) {
-            // ignore
-        }
-        nativeSpeechBackend?.release()
-        nativeSpeechBackend = null
     }
 }
