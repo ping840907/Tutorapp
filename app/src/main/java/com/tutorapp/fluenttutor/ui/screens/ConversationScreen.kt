@@ -90,7 +90,7 @@ fun ConversationScreen(
                             color = TextPrimary
                         )
                         Text(
-                            text = "SM8850 S2S Engine • RAM: ${uiState.realRamMb}MB • ${if (uiState.lastLatencyMs > 0) "${uiState.lastLatencyMs}ms" else "Ready"}",
+                            text = "On-device S2S • RAM: ${uiState.realRamMb}MB • ${if (uiState.lastLatencyMs > 0) "${uiState.lastLatencyMs}ms" else "Ready"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = SecondaryTeal
                         )
@@ -202,7 +202,7 @@ fun ConversationScreen(
                                 .size(16.dp)
                         )
                         Text(
-                            text = "SM8850 S2S Speech Generating...",
+                            text = "Thinking...",
                             fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = PrimaryBlue

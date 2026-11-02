@@ -1,12 +1,14 @@
 package com.tutorapp.fluenttutor.ui.viewmodel
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.tutorapp.fluenttutor.audio.AudioPlayer
 import com.tutorapp.fluenttutor.audio.AudioRecorder
 import com.tutorapp.fluenttutor.engine.LfmSpeechToSpeechEngine
-import com.tutorapp.fluenttutor.engine.MissionJudgeEngine
+import com.tutorapp.fluenttutor.engine.MissionStateMachine
+import com.tutorapp.fluenttutor.engine.StandInLfmBackend
 import com.tutorapp.fluenttutor.model.ChatMessage
 import com.tutorapp.fluenttutor.model.MessageSender
 import com.tutorapp.fluenttutor.model.MissionFinalSummary
@@ -15,13 +17,15 @@ import com.tutorapp.fluenttutor.model.MissionStatus
 import com.tutorapp.fluenttutor.model.NpcEmotion
 import com.tutorapp.fluenttutor.model.NpcInteractionState
 import com.tutorapp.fluenttutor.model.Scenario
-import com.tutorapp.fluenttutor.model.TurnEvaluation
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicInteger
 
 data class TutorUiState(
     val currentScenario: Scenario,
@@ -59,11 +63,21 @@ data class TutorUiState(
 
 class TutorViewModel(application: Application) : AndroidViewModel(application) {
 
-    private data class QueuedAudioSegment(
-        val pcmData: ByteArray,
+    private class QueuedAudioSegment(
+        val pcmData: ByteArray?,
         val durationMs: Long,
         val manualText: String? = null
     )
+
+    /**
+     * 每次 prepareScenario 建立一個新的 Session：自己的佇列、待處理計數與處理協程。
+     * 重設場景時舊 Session 整個被取消，舊結果不會污染新對話。
+     */
+    private class Session {
+        val queue = Channel<QueuedAudioSegment>(Channel.UNLIMITED)
+        val pending = AtomicInteger(0)
+        var job: Job? = null
+    }
 
     private val allScenarios = Scenario.getPredefinedEnglishScenarios()
     private val initialScenario = allScenarios.first()
@@ -77,13 +91,29 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<TutorUiState> = _uiState.asStateFlow()
 
-    // 雙引擎架構：主 S2S 引擎 + 副抗幻覺判定引擎
-    private val s2sEngine = LfmSpeechToSpeechEngine(application)
-    private val judgeEngine = MissionJudgeEngine()
+    // 單一模型架構：LFM3-Audio 輸出回覆與評分/目標判定，狀態機只負責驗證與記錄
+    // TODO: 接上真實 LFM3-Audio 後，將 StandInLfmBackend 換成實際的 LfmBackend 實作
+    private val s2sEngine = LfmSpeechToSpeechEngine(StandInLfmBackend(application))
+    private var stateMachine = MissionStateMachine(initialScenario)
+    private var missionState = stateMachine.initialState()
 
-    private val evaluations = mutableListOf<TurnEvaluation>()
     private val dialogHistory = mutableListOf<Pair<String, String>>()
-    private val audioQueueChannel = Channel<QueuedAudioSegment>(Channel.UNLIMITED)
+
+    @Volatile
+    private var session = Session()
+
+    // 音訊錄音器 (硬體 AEC 與自適應 VAD)；需先於 audioPlayer 宣告，因為播放狀態回呼會用到它
+    private val audioRecorder = AudioRecorder(
+        onSegmentReady = { pcmData, durationMs ->
+            enqueueAudioSegment(pcmData, durationMs)
+        },
+        onAmplitudeChanged = { amp ->
+            _uiState.update { it.copy(amplitude = amp) }
+        },
+        onSpeechStatusChanged = { isSpeaking ->
+            _uiState.update { it.copy(isUserSpeaking = isSpeaking) }
+        }
+    )
 
     // 音訊播放器 (支援 WAV 標頭解析、即時語音振幅同步與半雙工保護)
     private val audioPlayer = AudioPlayer(
@@ -98,57 +128,73 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         }
     )
 
-    // 音訊錄音器 (SM8850 硬體 AEC 與自適應 VAD)
-    private val audioRecorder = AudioRecorder(
-        onSegmentReady = { pcmData, durationMs ->
-            enqueueAudioSegment(pcmData, durationMs)
-        },
-        onAmplitudeChanged = { amp ->
-            _uiState.update { it.copy(amplitude = amp) }
-        },
-        onSpeechStatusChanged = { isSpeaking ->
-            _uiState.update { it.copy(isUserSpeaking = isSpeaking) }
-        }
-    )
-
     init {
-        // 啟動單一序列化佇列處理協程，消除任何並行並發狀態競態
-        startAudioProcessingQueue()
-        // 重設場景 (不在 init 搶播語音)
+        // 重設場景 (不在 init 搶播語音)，同時啟動第一個 Session 的處理協程
         prepareScenario(initialScenario)
     }
 
     /**
-     * 啟動單線程序列音訊處理管道
+     * 只接受「目前沒有處理中/排隊中」的語音，避免使用者連講造成佇列堆積與回合被雜音耗盡
      */
-    private fun startAudioProcessingQueue() {
-        viewModelScope.launch {
-            for (segment in audioQueueChannel) {
-                processSingleSegment(segment.pcmData, segment.durationMs, segment.manualText)
-            }
+    private fun enqueueAudioSegment(pcmData: ByteArray?, durationMs: Long, manualText: String? = null) {
+        if (_uiState.value.missionStatus != MissionStatus.IN_PROGRESS) return
+        val s = session
+        if (!s.pending.compareAndSet(0, 1)) return
+        if (s.queue.trySend(QueuedAudioSegment(pcmData, durationMs, manualText)).isFailure) {
+            s.pending.decrementAndGet()
         }
     }
 
-    private fun enqueueAudioSegment(pcmData: ByteArray, durationMs: Long, manualText: String? = null) {
-        if (_uiState.value.missionStatus != MissionStatus.IN_PROGRESS) return
-        audioQueueChannel.trySend(QueuedAudioSegment(pcmData, durationMs, manualText))
+    private fun startSession(): Session {
+        val s = Session()
+        s.job = viewModelScope.launch {
+            for (segment in s.queue) {
+                try {
+                    processSingleSegment(s, segment)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // 單一片段失敗不能讓整個處理協程死亡
+                    Log.e("TutorViewModel", "Failed to process segment", e)
+                    if (session === s) {
+                        _uiState.update {
+                            it.copy(
+                                isProcessing = false,
+                                messages = it.messages + ChatMessage(
+                                    sender = MessageSender.SYSTEM,
+                                    text = "⚠️ Something went wrong. Please try again."
+                                )
+                            )
+                        }
+                    }
+                } finally {
+                    s.pending.decrementAndGet()
+                }
+            }
+        }
+        return s
     }
 
     /**
-     * 重設與切換場景 (靜態重設，不搶播語音)
+     * 重設與切換場景 (靜態重設，不搶播語音)；取消進行中的處理並丟棄排隊中的語音
      */
     fun prepareScenario(scenario: Scenario) {
         audioRecorder.stopRecording(flushRemaining = false)
         audioPlayer.stop()
 
-        evaluations.clear()
+        val old = session
+        old.job?.cancel()
+        old.queue.close()
+        session = startSession()
+
         dialogHistory.clear()
-        val resetGoals = scenario.goals.map { it.copy(isCompleted = false) }
+        stateMachine = MissionStateMachine(scenario)
+        missionState = stateMachine.initialState()
 
         _uiState.update {
             it.copy(
                 currentScenario = scenario,
-                goals = resetGoals,
+                goals = missionState.goals,
                 messages = listOf(
                     ChatMessage(
                         sender = MessageSender.TUTOR,
@@ -158,6 +204,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                 isRecording = false,
                 isUserSpeaking = false,
                 isAiSpeaking = false,
+                isProcessing = false,
                 amplitude = 0f,
                 aiAmplitude = 0f,
                 offTopicStrikes = 0,
@@ -206,67 +253,53 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * 單一執行緒嚴格序列化處理語音片段
+     * 單一片段處理：模型推論 → 狀態機記錄 → 更新 UI → 播放回覆
      */
-    private suspend fun processSingleSegment(
-        pcmData: ByteArray,
-        durationMs: Long,
-        manualText: String?
-    ) {
-        if (_uiState.value.missionStatus != MissionStatus.IN_PROGRESS) return
+    private suspend fun processSingleSegment(s: Session, segment: QueuedAudioSegment) {
+        val ui = _uiState.value
+        if (ui.missionStatus != MissionStatus.IN_PROGRESS) return
 
-        val scenario = _uiState.value.currentScenario
-        val currentGoals = _uiState.value.goals
-        val turnIndex = evaluations.size
+        val scenario = ui.currentScenario
+        val state = missionState
 
         _uiState.update { it.copy(isProcessing = true) }
 
-        // 1. 主引擎推論 (LFM3 S2S 音訊特徵與回覆生成)
-        val s2sResult = s2sEngine.processSpeechToSpeech(
-            pcmData = pcmData,
-            durationMs = durationMs,
+        // 1. 單一模型推論：回覆語音 + 結構化 verdict (transcript / 離題 / 達成目標 / 評分)
+        val result = s2sEngine.process(
+            pcmData = segment.pcmData,
             scenario = scenario,
-            turnIndex = turnIndex,
-            manualText = manualText,
-            dialogHistory = dialogHistory
+            goals = state.goals,
+            history = dialogHistory.toList(),
+            manualText = segment.manualText
         )
+        if (session !== s) return // 場景已被重設，丟棄舊結果
 
-        // 2. 副引擎嚴密判定 (防止 2B 模型幻覺)
-        val evaluation = judgeEngine.evaluateTurn(
-            userInput = s2sResult.recognizedText,
-            currentGoals = currentGoals,
-            scenario = scenario,
-            turnIndex = turnIndex,
-            audioDurationMs = durationMs
-        )
-        evaluations.add(evaluation)
-        dialogHistory.add(Pair(s2sResult.recognizedText, s2sResult.replyText))
+        val output = result.output
 
-        // 3. 更新目標完成狀態清單
-        val updatedGoals = currentGoals.map { goal ->
-            if (evaluation.completedGoalIds.contains(goal.id)) {
-                goal.copy(isCompleted = true)
-            } else {
-                goal
+        // 2. 模型沒聽清楚或輸出格式錯誤：只回覆，不計回合、不改狀態
+        if (output == null || output.isUnintelligible) {
+            _uiState.update {
+                it.copy(
+                    isProcessing = false,
+                    messages = it.messages + ChatMessage(sender = MessageSender.TUTOR, text = result.replyText),
+                    lastEvaluationFeedback = "Didn't catch that — this turn was not counted.",
+                    realRamMb = result.realRamMb,
+                    lastLatencyMs = result.latencyMs
+                )
             }
+            playReply(result)
+            return
         }
 
-        // 4. 更新偏離 Strike 計數
-        val newStrikes = if (evaluation.isOffTopic) {
-            _uiState.value.offTopicStrikes + 1
-        } else {
-            _uiState.value.offTopicStrikes
-        }
+        // 3. 狀態機驗證並記錄模型的判定
+        val newState = stateMachine.applyTurn(state, output)
+        missionState = newState
+        dialogHistory.add(output.transcript to result.replyText)
 
-        // 5. 判定任務整體狀態 (過關 / 失敗 / 進行中)
-        val newStatus = judgeEngine.checkMissionStatus(
-            goals = updatedGoals,
-            offTopicStrikes = newStrikes,
-            totalTurns = evaluations.size,
-            scenario = scenario
-        )
+        val evaluation = newState.evaluations.last()
+        val newStatus = newState.status
 
-        // 6. 根據判定結果決定 NPC 的臉部表情與情緒狀態
+        // 4. NPC 臉部表情
         val updatedEmotion = when {
             newStatus == MissionStatus.PASSED -> NpcEmotion.EXCITED_PROUD
             newStatus == MissionStatus.FAILED -> NpcEmotion.DISAPPOINTED_FAILED
@@ -275,70 +308,62 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
             else -> NpcEmotion.HAPPY_ENCOURAGING
         }
 
-        // 7. 若任務終止，結算成績單
-        val summary = if (newStatus != MissionStatus.IN_PROGRESS) {
+        // 5. 任務終止：停止收音並結算
+        val summary = stateMachine.buildSummary(newState)
+        if (newStatus != MissionStatus.IN_PROGRESS) {
             audioRecorder.stopRecording(flushRemaining = false)
-            judgeEngine.generateFinalSummary(
-                status = newStatus,
-                goals = updatedGoals,
-                evaluations = evaluations,
-                offTopicStrikes = newStrikes,
-                scenario = scenario
-            )
-        } else null
+        }
 
-        // 8. 更新對話 UI
+        // 6. 更新對話 UI (原子更新)
         val userMsg = ChatMessage(
             sender = MessageSender.USER,
-            text = s2sResult.recognizedText,
-            audioDurationMs = durationMs,
+            text = output.transcript,
+            audioDurationMs = segment.durationMs,
             isOffTopic = evaluation.isOffTopic,
-            offTopicReason = if (evaluation.isOffTopic) "Off-topic strike ($newStrikes/${scenario.maxOffTopicStrikes})" else null
+            offTopicReason = if (evaluation.isOffTopic) {
+                "Off-topic strike (${newState.offTopicStrikes}/${scenario.maxOffTopicStrikes})"
+            } else null
         )
-
-        val aiMsg = ChatMessage(
-            sender = MessageSender.TUTOR,
-            text = s2sResult.replyText
-        )
-
-        val newMessages = _uiState.value.messages.toMutableList().apply {
+        val newMessages = buildList {
             add(userMsg)
-            add(aiMsg)
-            if (evaluation.isOffTopic) {
-                add(ChatMessage(sender = MessageSender.SYSTEM, text = evaluation.feedback))
-            }
-            if (evaluation.completedGoalIds.isNotEmpty()) {
-                add(ChatMessage(sender = MessageSender.SYSTEM, text = "🎯 Goal accomplished!"))
-            }
+            add(ChatMessage(sender = MessageSender.TUTOR, text = result.replyText))
+            if (evaluation.isOffTopic) add(ChatMessage(sender = MessageSender.SYSTEM, text = evaluation.feedback))
+            if (evaluation.completedGoalIds.isNotEmpty()) add(ChatMessage(sender = MessageSender.SYSTEM, text = "🎯 Goal accomplished!"))
         }
 
         _uiState.update {
             it.copy(
-                goals = updatedGoals,
-                messages = newMessages,
-                offTopicStrikes = newStrikes,
+                goals = newState.goals,
+                messages = it.messages + newMessages,
+                offTopicStrikes = newState.offTopicStrikes,
                 missionStatus = newStatus,
                 finalSummary = summary,
                 isProcessing = false,
                 npcEmotion = updatedEmotion,
                 lastEvaluationFeedback = evaluation.feedback,
-                realRamMb = s2sResult.realRamMb,
-                lastLatencyMs = s2sResult.latencyMs,
+                realRamMb = result.realRamMb,
+                lastLatencyMs = result.latencyMs,
                 isRecording = if (newStatus != MissionStatus.IN_PROGRESS) false else it.isRecording
             )
         }
 
-        // 9. 播放生成的音訊 (優先播放主引擎生成的波形，若空則走 TTS)
-        if (s2sResult.audioBytes != null && s2sResult.audioBytes.isNotEmpty()) {
-            audioPlayer.playAudioData(s2sResult.audioBytes)
+        // 7. 播放回覆
+        playReply(result)
+    }
+
+    /** 優先播放模型生成的語音，沒有則走系統 TTS */
+    private suspend fun playReply(result: LfmSpeechToSpeechEngine.S2SResult) {
+        val audio = result.audioBytes
+        if (audio != null && audio.isNotEmpty()) {
+            audioPlayer.playAudioData(audio)
         } else {
-            audioPlayer.speakText(s2sResult.replyText)
+            audioPlayer.speakText(result.replyText)
         }
     }
 
     fun sendManualText(text: String) {
-        val dummyPcm = ByteArray(16000 * 2)
-        enqueueAudioSegment(dummyPcm, 1000L, manualText = text)
+        if (text.isBlank()) return
+        enqueueAudioSegment(null, 0L, manualText = text)
     }
 
     fun playMessageAudio(message: ChatMessage) {
@@ -369,6 +394,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        session.job?.cancel()
         audioRecorder.stopRecording(flushRemaining = false)
         audioPlayer.release()
         s2sEngine.release()

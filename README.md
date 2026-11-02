@@ -1,8 +1,9 @@
 # FluentTutor AI 🎙️ - SM8850 旗艦級端側語音對答情境任務學習 App
 
-基於 **高通驍龍 8 Elite (Snapdragon 8 Elite / SM8850)** 旗艦晶片算力與記憶體頻寬，採用 **端側雙引擎協同架構 (Dual-Engine Edge Architecture)**：
-- **主推論引擎 (Primary Engine)**：Speech-to-Speech (S2S) 語音流對話生成。
-- **副判定引擎 (Judge & Anti-Hallucination Secondary Engine)**：專責防範 2B 多模態模型幻覺，提供精確的子目標達成狀態機、順序依賴性約束與語意偏離（Strike）審查。
+基於 **高通驍龍 8 Elite (Snapdragon 8 Elite / SM8850)** 旗艦晶片，採用 **單一模型端側架構 (Single-Model Edge Architecture)**：
+- **唯一模型 LFM3-Audio**：同一次推論同時輸出口說回覆與結構化判定 (逐字稿、是否離題、達成的目標 id、相關度/流暢度評分、一句回饋)。
+- **任務狀態機 (MissionStateMachine)**：不做任何語意判斷，只驗證模型輸出 (忽略未知 id、強制目標順序、離題 Strike 計數、分數夾在 0~100) 並記錄、推進過關/失敗。
+- **推論後端 (LfmBackend)**：真實 LFM3-Audio 執行期實作此介面即可接入；目前內建 StandInLfmBackend 為**開發替身** (只理解手動輸入文字，純語音會回報聽不清楚)，**尚未接上真實模型**。
 
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-purple.svg)](https://kotlinlang.org)
 [![Android](https://img.shields.io/badge/Android-SDK%2035-brightgreen.svg)](https://developer.android.com)
@@ -13,15 +14,14 @@
 
 ## 🌟 核心架構與改進成果
 
-### 1. 雙引擎協同抗幻覺機制 (Dual-Engine Anti-Hallucination)
-- **核心痛點**：2B Speech-to-Speech 模型擅長自然語音交互，但在執行結構化目標判定時容易產生幻覺 (Hallucination) 或出現寬鬆包含誤判。
-- **解決方案**：
-  - **主引擎 (`LfmSpeechToSpeechEngine`)**：專注 16kHz PCM 音訊分析、多輪上下文狀態追蹤與端側語音波形合成。
-  - **副引擎 (`MissionJudgeEngine`)**：完全獨立運行，採用全詞邊界（Regex Word Boundary）與負向否定詞過濾（例如「no oat milk」不會被誤判為完成點餐），並強制遵守階段順序約束（例如點餐場景必須依序：指定飲品 ➔ 冷熱尺寸 ➔ 結帳付款，防止一句話作弊一次過關）。
+### 1. 單一模型 + 狀態機 (Single Model, State-Machine Recording)
+- **輸出協議**：模型在口說回覆之後附上 `<verdict>{json}</verdict>` (見 `ModelOutputParser`)，提示詞由 `LfmPromptBuilder` 依場景與目標進度產生。
+- **防幻覺護欄 (不靠第二個模型)**：未知 goal id 忽略、離題回合不記錄目標、前置目標未完成不接受後續目標、輸出缺 verdict 或 transcript 為空時該回合不計分。
+- **Session 隔離**：重設/返回場景會取消進行中的處理並丟棄排隊語音；單一片段例外不會讓處理協程死亡；處理中不堆積新語音。
 
 ### 2. 極限榨取 SM8850 旗艦晶片算力與記憶體
 - **Oryon CPU + LPDDR5X (12GB~16GB) 高頻寬優化**：
-  - 零拷貝環形緩存 (Zero-Copy Ring Buffer) 與 80-bin Mel Spectrogram 特徵並行計算。
+  - 300ms 前導環形緩存 + 自適應 VAD 分段收音。
   - 即時顯示真實系統指標：即時進程 PSS RAM (MB) 與端側原生延遲 (ms)，徹底清除任何假資料。
 
 ### 3. 硬體級防回音 (AEC) 與半雙工保護
@@ -62,8 +62,8 @@ com.tutorapp.fluenttutor
 │   ├── VoiceActivityDetector.kt  # 取樣數精準計時、自適應噪聲基線即時斷句 VAD
 │   └── AudioPlayer.kt            # 智慧 WAV 標頭解析、多取樣率 AudioTrack 播放器
 ├── engine/
-│   ├── LfmSpeechToSpeechEngine.kt # 主引擎：SM8850 S2S 語音流對話與波形合成
-│   └── MissionJudgeEngine.kt      # 副引擎：防幻覺目標達成狀態機與偏離懲罰審查
+│   ├── LfmSpeechToSpeechEngine.kt # 唯一推論引擎：提示詞 → LfmBackend → 解析 verdict
+│   ├── LfmBackend.kt / LfmPromptBuilder.kt / ModelTurnOutput.kt  # 後端介面、提示詞、輸出協議與解析器`n│   ├── StandInLfmBackend.kt       # 開發替身 (非真實模型)`n│   └── MissionStateMachine.kt     # 任務狀態機：驗證並記錄模型判定
 ├── model/
 │   ├── Scenario.kt               # 精選英語任務場景與專屬 NPC 角色設定
 │   ├── NpcAvatarModels.kt        # NPC 造型、互動狀態與情緒表情狀態機定義
@@ -73,7 +73,7 @@ com.tutorapp.fluenttutor
 └── ui/
     ├── screens/
     │   ├── ScenarioSelectScreen.kt # 關卡任務選擇
-    │   └── ConversationScreen.kt   # 雙引擎即時語音對答與動態 NPC 主畫面
+    │   └── ConversationScreen.kt   # 即時語音對答與動態 NPC 主畫面
     ├── components/
     │   ├── NpcAvatarCard.kt        # 即時動態向量 NPC 頭像 (Lip-Sync / 表情 / 眨眼)
     │   └── ...                     # 聲波視覺化、目標進度卡、結算彈窗

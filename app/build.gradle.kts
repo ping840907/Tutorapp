@@ -63,10 +63,6 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
 
-    // Networking
-    implementation(libs.okhttp)
-    implementation(libs.okhttp.logging)
-
     // JSON
     implementation(libs.gson)
 

@@ -1,25 +1,24 @@
 package com.tutorapp.fluenttutor
 
 import com.tutorapp.fluenttutor.audio.AudioPlayer
+import com.tutorapp.fluenttutor.engine.LfmBackend
+import com.tutorapp.fluenttutor.engine.LfmRawResponse
+import com.tutorapp.fluenttutor.engine.LfmRequest
+import com.tutorapp.fluenttutor.engine.LfmSpeechToSpeechEngine
+import kotlinx.coroutines.runBlocking
 import com.tutorapp.fluenttutor.model.NpcAvatarStyle
 import com.tutorapp.fluenttutor.model.NpcInteractionState
 import com.tutorapp.fluenttutor.model.Scenario
 import com.tutorapp.fluenttutor.ui.viewmodel.TutorUiState
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 class LfmSpeechToSpeechEngineTest {
-
-    @Test
-    fun testAudioFeatureMelExtractionLogic() {
-        // 模擬 1 秒 16kHz 16-bit PCM 音訊 (32000 bytes)
-        val pcm = ByteArray(32000) { (it % 127).toByte() }
-        val shortsCount = pcm.size / 2
-        assertTrue("PCM should have 16000 samples", shortsCount == 16000)
-    }
 
     @Test
     fun testParseWavHeaderWithExtraRiffChunks() {
@@ -91,5 +90,41 @@ class LfmSpeechToSpeechEngineTest {
         val speakingState = idleState.copy(isAiSpeaking = true, aiAmplitude = 0.8f, amplitude = 0.0f)
         assertEquals(NpcInteractionState.SPEAKING, speakingState.npcInteractionState)
         assertEquals(0.8f, speakingState.activeAmplitude, 0.001f)
+    }
+
+    private class FakeBackend(private val text: String) : LfmBackend {
+        var lastRequest: LfmRequest? = null
+        override suspend fun generate(request: LfmRequest): LfmRawResponse {
+            lastRequest = request
+            return LfmRawResponse(text, null)
+        }
+        override fun release() {}
+    }
+
+    @Test
+    fun engineParsesVerdictAndBuildsPromptWithGoals() = runBlocking {
+        val scenario = Scenario.getPredefinedEnglishScenarios().first()
+        val backend = FakeBackend(
+            "Got it!\n<verdict>{\"transcript\":\"an oat latte\",\"off_topic\":false,\"goals\":[\"goal_drink_oat\"],\"relevance\":90,\"fluency\":85,\"feedback\":\"\"}</verdict>"
+        )
+        val engine = LfmSpeechToSpeechEngine(backend) { 123L }
+        val result = engine.process(null, scenario, scenario.goals, emptyList(), "an oat latte")
+
+        assertEquals("Got it!", result.replyText)
+        assertNotNull(result.output)
+        assertEquals(listOf("goal_drink_oat"), result.output!!.completedGoalIds)
+        assertEquals(123L, result.realRamMb)
+        val prompt = backend.lastRequest!!.systemPrompt
+        assertTrue(prompt.contains("[goal_drink_oat]"))
+        assertTrue(prompt.contains("<verdict>"))
+    }
+
+    @Test
+    fun engineFallsBackWhenModelOmitsVerdict() = runBlocking {
+        val scenario = Scenario.getPredefinedEnglishScenarios().first()
+        val engine = LfmSpeechToSpeechEngine(FakeBackend("Just chatting")) { 0L }
+        val result = engine.process(null, scenario, scenario.goals, emptyList(), "hi")
+        assertNull(result.output)
+        assertEquals("Just chatting", result.replyText)
     }
 }

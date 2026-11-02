@@ -25,8 +25,7 @@ data class Scenario(
                 avatarStyle = NpcAvatarStyle.BARISTA_SARAH,
                 systemPrompt = """
                     You are Sarah, a warm and efficient barista at Bean & Leaf cafe in Manhattan.
-                    Speak naturally in concise spoken English (1-2 sentences).
-                    Ask for missing order details sequentially: drink, milk choice, size/temperature, and payment method.
+                    Ask for missing order details one at a time: drink, milk choice, size/temperature, then payment method.
                 """.trimIndent(),
                 initialGreeting = "Hi there! Welcome to Bean & Leaf. What can I get started for you today?",
                 goals = listOf(
@@ -34,33 +33,21 @@ data class Scenario(
                         id = "goal_drink_oat",
                         title = "Order a latte with oat milk",
                         explanation = "Say you'd like a latte and ask for oat milk.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(latte|coffee)\\b", RegexOption.IGNORE_CASE),
-                            Regex("\\b(oat\\s*milk|oat)\\b", RegexOption.IGNORE_CASE)
-                        ),
-                        negativeExclusions = listOf(
-                            Regex("\\b(no|without|don't\\s*want|not)\\s+(oat|latte)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner orders a latte (or coffee) AND asks for oat milk. Not satisfied if they refuse or negate oat milk.",
                         orderIndex = 1
                     ),
                     MissionGoal(
                         id = "goal_temp_size",
                         title = "Specify temperature & size",
                         explanation = "State size (small/medium/large) and iced or hot.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(iced|hot|cold)\\b", RegexOption.IGNORE_CASE),
-                            Regex("\\b(small|medium|large|tall|grande|venti)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner states BOTH the temperature (iced/hot) AND the size (small/medium/large or tall/grande/venti) of the drink.",
                         orderIndex = 2
                     ),
                     MissionGoal(
                         id = "goal_payment",
                         title = "Complete payment & thank barista",
                         explanation = "Say how you'll pay (card/cash/apple pay) and say thanks.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(card|cash|apple\\s*pay|pay|credit)\\b", RegexOption.IGNORE_CASE),
-                            Regex("\\b(thanks|thank\\s*you|here\\s*you\\s*go)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner says how they will pay (card, cash, Apple Pay, etc.) AND thanks the barista.",
                         orderIndex = 3
                     )
                 )
@@ -76,7 +63,8 @@ data class Scenario(
                 avatarStyle = NpcAvatarStyle.CONCIERGE_DAVID,
                 systemPrompt = """
                     You are David, the concierge at Grand Hyatt. Polite, clear, and professional.
-                    Acknowledge the reservation, provide room key info, and answer guest questions.
+                    Acknowledge the reservation, provide room key info (Room 704), and answer guest questions.
+                    Breakfast is on the 2nd floor from 6:30 to 10:00 AM; the Wi-Fi network is HyattGuest with no password.
                 """.trimIndent(),
                 initialGreeting = "Good afternoon, welcome to Grand Hyatt. How may I assist you with your stay?",
                 goals = listOf(
@@ -84,30 +72,21 @@ data class Scenario(
                         id = "goal_hotel_checkin",
                         title = "State reservation & check-in",
                         explanation = "Mention you'd like to check in and have a reservation.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(check\\s*in|checking\\s*in)\\b", RegexOption.IGNORE_CASE),
-                            Regex("\\b(reservation|booking|name)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner says they want to check in AND mentions a reservation/booking (or gives the name it is under).",
                         orderIndex = 1
                     ),
                     MissionGoal(
                         id = "goal_hotel_amenities",
-                        title = "Ask about breakfast & Wi-Fi",
+                        title = "Ask about breakfast or Wi-Fi",
                         explanation = "Inquire about breakfast time or Wi-Fi login.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(breakfast|morning\\s*meal)\\b", RegexOption.IGNORE_CASE),
-                            Regex("\\b(wi-?fi|internet|password)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner asks about breakfast (time/place) OR about the Wi-Fi (network/password).",
                         orderIndex = 2
                     ),
                     MissionGoal(
                         id = "goal_hotel_key",
                         title = "Acknowledge room key & say thanks",
                         explanation = "Confirm the room key and express appreciation.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(key|room|elevator)\\b", RegexOption.IGNORE_CASE),
-                            Regex("\\b(thank|thanks|appreciate|great)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner acknowledges receiving the room key/room information AND thanks the concierge.",
                         orderIndex = 3
                     )
                 )
@@ -123,7 +102,8 @@ data class Scenario(
                 avatarStyle = NpcAvatarStyle.AGENT_ELENA,
                 systemPrompt = """
                     You are Elena, a customer service agent for Delta Air Lines at JFK airport.
-                    Keep sentences concise, professional, and friendly.
+                    Keep sentences concise, professional, and friendly. Seats available: 14A (window), 14C (aisle).
+                    The flight departs from Gate B22 and boarding begins at 10:15 AM.
                 """.trimIndent(),
                 initialGreeting = "Good morning! Flying with Delta today? May I see your passport and ticket please?",
                 goals = listOf(
@@ -131,27 +111,21 @@ data class Scenario(
                         id = "goal_flight_info",
                         title = "State destination & pass ticket",
                         explanation = "Say where you are flying to and offer your passport/ticket.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(flight|flying|ticket|passport|here\\s*is)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner says where they are flying to AND offers/presents their passport or ticket.",
                         orderIndex = 1
                     ),
                     MissionGoal(
                         id = "goal_seat_choice",
                         title = "Request window or aisle seat",
                         explanation = "Ask for either a window seat or an aisle seat.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(window|aisle|seat)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner explicitly requests a window seat OR an aisle seat.",
                         orderIndex = 2
                     ),
                     MissionGoal(
                         id = "goal_gate_time",
                         title = "Confirm boarding gate & time",
                         explanation = "Ask what gate and what time boarding starts.",
-                        requiredPatterns = listOf(
-                            Regex("\\b(gate|boarding|time)\\b", RegexOption.IGNORE_CASE)
-                        ),
+                        criteria = "The learner asks which gate the flight leaves from AND/OR what time boarding starts.",
                         orderIndex = 3
                     )
                 )
