@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">FluentTutor AI</string>
+    <string name="scenario_cafe_title">Cafe Order</string>
+    <string name="scenario_cafe_desc">Order an oat milk latte at a cozy coffee shop.</string>
+</resources>
