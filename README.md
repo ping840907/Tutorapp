@@ -9,6 +9,11 @@
 [![Android](https://img.shields.io/badge/Android-SDK%2035-brightgreen.svg)](https://developer.android.com)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose%20M3-blue.svg)](https://developer.android.com/jetpack/compose)
 [![Chipset](https://img.shields.io/badge/Target%20Chip-Snapdragon%20SM8850-red.svg)](https://qualcomm.com)
+[![Retrospective](https://img.shields.io/badge/Docs-踩坑紀錄與復盤總結-orange.svg)](PITFALLS_AND_RETROSPECTIVE.md)
+
+---
+
+> 📖 **開發歷程與避坑指南**：請參閱 [踩坑紀錄與失敗嘗試總結 (PITFALLS_AND_RETROSPECTIVE.md)](PITFALLS_AND_RETROSPECTIVE.md)，包含語音輸入收音 HAL 靜音、VAD 門檻、神經 Vocoder 沙沙白噪音消除、手動輸入與死板模板解耦之詳細復盤。
 
 ---
 
