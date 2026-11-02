@@ -1,25 +1,23 @@
 # FluentTutor AI 🎙️ - SM8850 旗艦級端側語音對答情境任務學習 App
 
-端側英語口說情境任務 App。管線做法參考 [Verbead](https://github.com/ping840907/Verbead) 已在實機驗證的實作：
+端側英語口說情境任務 App，**全程使用 Liquid AI LFM3-Audio-2B (GGUF)**，實作移植自 [Verbead](https://github.com/ping840907/Verbead) 的 `exp/lfm3-audio-2b` (`Lfm3GgufRunner`，已在實機驗證 ASR 與 TTS)：
 
-- **ASR**：sherpa-onnx + Qwen3-ASR (int8)，離線辨識。使用者說的話只來自這裡，辨識不到就顯示「Nothing recognized」，不會補任何預設內容。
-- **對話與評分**：llama.cpp 載入 Qwen3.5 GGUF，生成 NPC 回覆 + `<verdict>{json}</verdict>` (離題 / 達成目標 / 評分 / 表情)。
-- **TTS**：Android `TextToSpeech` (STREAM_MUSIC，設定同 Verbead `TtsSpeaker`)。已移除自製神經 vocoder，那是沙沙雜音的來源。
-- **任務狀態機 (MissionStateMachine)**：只驗證模型輸出並記錄、推進過關/失敗。
-- **不使用** `SpeechRecognizer`、雲端 STT/TTS API；模型缺失或載入失敗時直接把錯誤顯示在對話中，**沒有任何寫死對白**。
+- **ASR**：`llama-mtmd-cli` + LFM3 GGUF + mmproj，`-sys "Perform ASR."`。使用者說的話只來自這裡 (或手動輸入)；辨識不到就提示，不補任何字。
+- **對話與評分**：同一個 LFM3 模型 (文字模式) 生成 NPC 回覆 + `<verdict>{json}</verdict>` (離題 / 達成目標 / 評分 / 表情)。引擎一律以 ASR 結果覆蓋 verdict 內的 transcript。
+- **TTS**：`llama-tts` + LFM3 (`--tts-lang`, 24 kHz)，由 `AudioPlayer` 以 AudioTrack 播放，嘴型振幅取自實際 PCM。
+- 這些 llama.cpp 執行檔以子行程執行，硬體後端依序嘗試 HTP0 (Hexagon NPU) → GPUOpenCL → CPU。
+- **不使用** `SpeechRecognizer`、`TextToSpeech`、任何雲端服務；模型缺失或推論失敗時直接把錯誤顯示在對話中，**沒有寫死對白**。
+- 各語言的 TTS 語言設定在 `Scenario.ttsLanguage`。
 
-## 🔧 首次安裝：準備模型與函式庫
+## 🔧 首次安裝：準備模型
 
-1. 下載 [sherpa-onnx-1.13.8.aar](https://github.com/k2-fsa/sherpa-onnx/releases/tag/v1.13.8) 放到 `app/libs/` (`*.aar` 不進版控；建置時 `alignSherpaAar` 會自動對齊 ONNX Runtime 符號版本，同 Verbead)。
-2. 把模型放到裝置的 `/sdcard/Android/data/com.tutorapp.fluenttutor/files/models/` (目錄結構與 Verbead 相同，可直接複製 Verbead 已下載的)：
-   ```
-   models/qwen3_asr/conv_frontend.onnx
-   models/qwen3_asr/encoder.int8.onnx
-   models/qwen3_asr/decoder.int8.onnx
-   models/qwen3_asr/tokenizer/
-   models/slm/Qwen3.5-2B-Q4_K_M.gguf   # 也接受 4B / 0.8B / 9B
-   ```
-3. 缺檔時進入場景會列出缺少的完整路徑。
+把兩個 GGUF (取自 [LiquidAI/LFM3-Audio-2B-GGUF](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF)，Verbead 已下載的可直接複製) 放到裝置：
+
+```
+/sdcard/Android/data/com.tutorapp.fluenttutor/files/models/lfm3_audio/LFM3-Audio-2B-Q4_0.gguf
+/sdcard/Android/data/com.tutorapp.fluenttutor/files/models/lfm3_audio/mmproj-LFM3-Audio-2B-Q8_0.gguf
+```
+llama.cpp 執行檔與 ggml 函式庫 (約 170 MB) 已隨 `app/src/main/jniLibs/arm64-v8a/` 提供 (複製自 Verbead)。缺檔時進入場景會列出缺少的完整路徑。
 
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-purple.svg)](https://kotlinlang.org)
 [![Android](https://img.shields.io/badge/Android-SDK%2035-brightgreen.svg)](https://developer.android.com)
@@ -81,10 +79,10 @@ com.tutorapp.fluenttutor
 ├── audio/
 │   ├── AudioRecorder.kt          # SM8850 硬體 AEC、300ms 前導緩衝、半雙工保護錄音器
 │   ├── VoiceActivityDetector.kt  # 取樣數精準計時、自適應噪聲基線即時斷句 VAD
-│   └── AudioPlayer.kt            # 系統 TextToSpeech 播放 (設定同 Verbead TtsSpeaker)
+│   └── AudioPlayer.kt            # 24 kHz float PCM 播放 (LFM3 TTS 輸出) + 真實 RMS 嘴型振幅
 ├── engine/
-│   ├── Qwen3AsrEngine.kt          # sherpa-onnx 離線 ASR (同 Verbead)
-│   ├── LlamaChatBackend.kt        # ASR → llama.cpp LLM；失敗即丟例外，無罐頭對白
+│   ├── Lfm3GgufRunner.kt          # llama-mtmd-cli / llama-tts 子行程：ASR、對話、TTS (移植自 Verbead)
+│   ├── Lfm3Backend.kt             # ASR → 對話 → TTS，失敗即丟例外，無罐頭對白
 │   ├── LfmSpeechToSpeechEngine.kt # 提示詞 → 後端 → 解析 verdict (transcript 以 ASR 為準)
 │   ├── ModelStore.kt              # 模型檔位置與缺檔檢查
 │   ├── LfmBackend.kt / LfmPromptBuilder.kt / ModelTurnOutput.kt

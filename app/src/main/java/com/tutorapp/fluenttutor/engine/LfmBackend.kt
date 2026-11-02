@@ -24,11 +24,13 @@ class LfmRawResponse(
 )
 
 /**
- * 推論後端：ASR → LLM。實作失敗時丟出 [ModelNotReadyException] 或其他例外，
+ * 推論後端：LFM3 ASR → LFM3 對話 → LFM3 TTS。實作失敗時丟出 [ModelNotReadyException] 或其他例外，
  * 呼叫端必須把錯誤顯示給使用者，不得以預設對白頂替。
  */
 interface LfmBackend {
     suspend fun generate(request: LfmRequest): LfmRawResponse
     suspend fun generateGreeting(scenario: Scenario): String
+    /** 把 NPC 回覆合成為 24 kHz 單聲道 float PCM；失敗丟例外 (不退回其他 TTS) */
+    suspend fun synthesizeSpeech(text: String, language: String): FloatArray
     fun release()
 }

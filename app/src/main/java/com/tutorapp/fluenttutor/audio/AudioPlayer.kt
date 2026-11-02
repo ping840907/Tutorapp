@@ -1,13 +1,8 @@
 package com.tutorapp.fluenttutor.audio
 
-import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioManager
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -16,144 +11,103 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.util.Locale
-import kotlin.math.abs
-import kotlin.math.sin
+import kotlin.coroutines.coroutineContext
+import kotlin.math.sqrt
 
 /**
- * NPC 語音播放器。
- *
- * TTS 設定與 Verbead 的 TtsSpeaker 完全一致 (該實作已在實機驗證可正常發聲)：
- * Android TextToSpeech + STREAM_MUSIC + CONTENT_TYPE_SPEECH。
- * 不再有自製 vocoder / 神經 codec 路徑 —— 那條路徑是「沙沙雜音」的來源。
- *
- * 注意：TextToSpeech.speak() 不會把 PCM 交給 App，所以嘴型振幅是依播放狀態產生的模擬動畫，不是真實音量。
+ * 播放 LFM3 TTS 產生的 24 kHz 單聲道 float PCM (AudioTrack 設定同 Verbead 的 PcmPlayer，已實機驗證)。
+ * 這裡沒有 TextToSpeech：沒有 PCM 就不會有聲音，由呼叫端顯示錯誤。
+ * 嘴型振幅是播放中實際 PCM 的 RMS。
  */
 class AudioPlayer(
-    context: Context,
     private val onPlaybackStateChanged: (isPlaying: Boolean) -> Unit,
     private val onPlaybackAmplitudeChanged: (amplitude: Float) -> Unit = {}
-) : TextToSpeech.OnInitListener {
-
+) {
     companion object {
         private const val TAG = "AudioPlayer"
-        private const val UTTERANCE_PREFIX = "tutor_tts_"
+        private const val CHUNK_MS = 40
     }
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val scope = CoroutineScope(Dispatchers.Default)
-    private var amplitudeJob: Job? = null
+    private val scope = CoroutineScope(Dispatchers.IO)
+    @Volatile private var job: Job? = null
+    @Volatile private var track: AudioTrack? = null
 
-    private var tts: TextToSpeech? = TextToSpeech(context.applicationContext, this)
-    @Volatile private var isReady = false
-    @Volatile private var currentUtterance: String? = null
-    private var pendingText: String? = null
-
-    override fun onInit(status: Int) {
-        val engine = tts ?: return
-        if (status != TextToSpeech.SUCCESS) {
-            Log.e(TAG, "TextToSpeech init failed, status=$status")
-            return
-        }
-        var result = engine.setLanguage(Locale.US)
-        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-            result = engine.setLanguage(Locale.ENGLISH)
-        }
-        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-            Log.w(TAG, "No English TTS voice data installed on this device")
-        }
-        engine.setAudioAttributes(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-        )
-        engine.setPitch(1.0f)
-        engine.setSpeechRate(1.0f)
-        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {
-                if (utteranceId != currentUtterance) return
-                mainHandler.post {
-                    onPlaybackStateChanged(true)
-                    startAmplitudeSimulation()
+    fun play(samples: FloatArray, sampleRate: Int = 24_000) {
+        stop()
+        if (samples.isEmpty()) return
+        val myJob = scope.launch {
+            val self = coroutineContext[Job]
+            val t = try {
+                val minBuf = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
+                AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(maxOf(minBuf, sampleRate * 4 / 2))
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+            } catch (e: Throwable) {
+                Log.e(TAG, "AudioTrack create failed: ${e.message}", e)
+                return@launch
+            }
+            track = t
+            try {
+                onPlaybackStateChanged(true)
+                t.play()
+                val chunk = sampleRate * CHUNK_MS / 1000
+                var pos = 0
+                while (pos < samples.size && isActive) {
+                    val n = minOf(chunk, samples.size - pos)
+                    var sum = 0.0
+                    for (i in pos until pos + n) sum += samples[i] * samples[i]
+                    onPlaybackAmplitudeChanged((sqrt(sum / n).toFloat() * 4f).coerceIn(0.05f, 1f))
+                    val w = t.write(samples, pos, n, AudioTrack.WRITE_BLOCKING)
+                    if (w < 0) { Log.w(TAG, "write error $w"); break }
+                    pos += w
+                }
+                // 等待排空，避免提前解除半雙工靜音造成尾音自激
+                val deadline = System.currentTimeMillis() + (samples.size * 1000L / sampleRate) + 500
+                while (isActive && t.playbackHeadPosition < samples.size && System.currentTimeMillis() < deadline) delay(20)
+            } catch (e: Throwable) {
+                Log.w(TAG, "playback error: ${e.message}")
+            } finally {
+                releaseTrack(t)
+                // 已被新的 play() 取代時，不要蓋掉新播放的狀態
+                if (job === self || job == null) {
+                    if (track === t) track = null
+                    onPlaybackAmplitudeChanged(0f)
+                    onPlaybackStateChanged(false)
                 }
             }
-
-            override fun onDone(utteranceId: String?) = finish(utteranceId)
-
-            @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) {
-                Log.w(TAG, "TTS error for $utteranceId")
-                finish(utteranceId)
-            }
-        })
-        isReady = true
-        Log.i(TAG, "TextToSpeech ready, voice=${engine.voice?.name}, locale=${engine.voice?.locale}")
-        pendingText?.let { pendingText = null; speakText(it) }
+        }
+        job = myJob
     }
 
-    private fun finish(utteranceId: String?) {
-        if (utteranceId != currentUtterance) return // 已被新的 utterance 取代
-        currentUtterance = null
-        mainHandler.post {
-            stopAmplitudeSimulation()
-            onPlaybackStateChanged(false)
-        }
-    }
-
-    /** 念出文字 (取代正在播放的內容)。 */
-    fun speakText(text: String) {
-        if (text.isBlank()) return
-        if (!isReady) {
-            pendingText = text
-            return
-        }
-        val id = "$UTTERANCE_PREFIX${System.nanoTime()}"
-        currentUtterance = id
-        val params = Bundle().apply {
-            putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
-        }
-        val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
-        if (r != TextToSpeech.SUCCESS) {
-            Log.w(TAG, "speak() failed: $r")
-            finish(id)
-        }
+    private fun releaseTrack(t: AudioTrack) {
+        runCatching { t.pause(); t.flush(); t.stop() }
+        runCatching { t.release() }
     }
 
     fun stop() {
-        pendingText = null
-        val wasPlaying = currentUtterance != null
-        currentUtterance = null
-        runCatching { tts?.stop() }
-        mainHandler.post {
-            stopAmplitudeSimulation()
-            if (wasPlaying) onPlaybackStateChanged(false)
-        }
+        val j = job
+        job = null
+        j?.cancel()
+        track?.let { releaseTrack(it) }
+        track = null
     }
 
     fun release() {
         stop()
-        runCatching { tts?.shutdown() }
-        tts = null
-        isReady = false
         scope.cancel()
-    }
-
-    private fun startAmplitudeSimulation() {
-        amplitudeJob?.cancel()
-        amplitudeJob = scope.launch {
-            var phase = 0.0
-            while (isActive) {
-                phase += 0.4
-                onPlaybackAmplitudeChanged((0.20f + 0.60f * abs(sin(phase)).toFloat()).coerceIn(0.08f, 0.90f))
-                delay(60L)
-            }
-        }
-    }
-
-    private fun stopAmplitudeSimulation() {
-        amplitudeJob?.cancel()
-        amplitudeJob = null
-        onPlaybackAmplitudeChanged(0f)
     }
 }

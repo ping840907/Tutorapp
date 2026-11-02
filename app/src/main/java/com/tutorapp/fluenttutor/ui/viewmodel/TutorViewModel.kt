@@ -8,7 +8,7 @@ import com.tutorapp.fluenttutor.audio.AudioPlayer
 import com.tutorapp.fluenttutor.audio.AudioRecorder
 import com.tutorapp.fluenttutor.engine.LfmSpeechToSpeechEngine
 import com.tutorapp.fluenttutor.engine.MissionStateMachine
-import com.tutorapp.fluenttutor.engine.LlamaChatBackend
+import com.tutorapp.fluenttutor.engine.Lfm3Backend
 import com.tutorapp.fluenttutor.engine.ModelStore
 import com.tutorapp.fluenttutor.model.ChatMessage
 import com.tutorapp.fluenttutor.model.MessageSender
@@ -92,8 +92,9 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<TutorUiState> = _uiState.asStateFlow()
 
-    // ASR (sherpa-onnx Qwen3-ASR) → LLM (llama.cpp Qwen3.5 GGUF) → 系統 TTS；做法參考 Verbead
-    private val s2sEngine = LfmSpeechToSpeechEngine(LlamaChatBackend(application))
+    // 全程 LFM3-Audio-2B GGUF：ASR → 對話/評分 → TTS (移植自 Verbead 已驗證的實作)
+    private val s2sEngine = LfmSpeechToSpeechEngine(Lfm3Backend(application))
+    private var speakJob: Job? = null
     private var stateMachine = MissionStateMachine(initialScenario)
     private var missionState = stateMachine.initialState()
 
@@ -115,6 +116,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         },
         onBargeInTriggered = {
             // 使用者在 AI 發言時主動開口打斷：立即停止播放，讓對話主控權回到使用者
+            speakJob?.cancel()
             audioPlayer.stop()
             _uiState.update { it.copy(isAiSpeaking = false, aiAmplitude = 0f) }
         }
@@ -122,7 +124,6 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
 
     // 音訊播放器 (支援 WAV 標頭解析、即時語音振幅同步與半雙工保護)
     private val audioPlayer: AudioPlayer = AudioPlayer(
-        context = application,
         onPlaybackStateChanged = { isPlaying ->
             _uiState.update { it.copy(isAiSpeaking = isPlaying) }
             // 半雙工防回音：當 AI 播放語音時，麥克風自動阻斷自激
@@ -175,6 +176,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun prepareScenario(scenario: Scenario) {
         audioRecorder.stopRecording(flushRemaining = false)
+        speakJob?.cancel()
         audioPlayer.stop()
 
         val old = session
@@ -236,12 +238,36 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                         realRamMb = s2sEngine.getRealMemoryUsageMb()
                     )
                 }
-                audioPlayer.speakText(greeting)
+                speak(greeting)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.e("TutorViewModel", "Greeting failed", e)
                 if (session === s) showSystemError(e.message ?: e.toString())
+            }
+        }
+    }
+
+    /** LFM3 TTS 合成後以 PCM 播放；失敗只顯示錯誤，不退回其他語音服務 */
+    private fun speak(text: String) {
+        if (text.isBlank()) return
+        speakJob?.cancel()
+        audioPlayer.stop()
+        val s = session
+        val language = _uiState.value.currentScenario.ttsLanguage
+        _uiState.update { it.copy(isProcessing = true) } // 合成期間 NPC 顯示思考中
+        speakJob = viewModelScope.launch {
+            try {
+                val pcm = s2sEngine.synthesizeSpeech(text, language)
+                if (session !== s) return@launch
+                audioPlayer.play(pcm, ModelStore.TTS_SAMPLE_RATE)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("TutorViewModel", "TTS failed", e)
+                if (session === s) showSystemError("LFM3 TTS failed: ${e.message}")
+            } finally {
+                if (session === s) _uiState.update { it.copy(isProcessing = false) }
             }
         }
     }
@@ -334,7 +360,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
                     lastLatencyMs = result.latencyMs
                 )
             }
-            audioPlayer.speakText(result.replyText)
+            speak(result.replyText)
             return
         }
 
@@ -393,25 +419,26 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         // 7. 播放回覆
-        audioPlayer.speakText(result.replyText)
+        speak(result.replyText)
     }
 
     fun sendManualText(text: String) {
         if (text.isBlank()) return
         // 手動輸入時主動打斷當前正在播放的 AI 語音，釋放半雙工鎖
+        speakJob?.cancel()
         audioPlayer.stop()
         _uiState.update { it.copy(isAiSpeaking = false, aiAmplitude = 0f) }
         enqueueAudioSegment(null, 0L, manualText = text)
     }
 
     fun playMessageAudio(message: ChatMessage) {
-        audioPlayer.speakText(message.text)
+        speak(message.text)
     }
 
     fun replayLastAiMessage() {
         val lastTutorMsg = _uiState.value.messages.lastOrNull { it.sender == MessageSender.TUTOR }
         if (lastTutorMsg != null) {
-            audioPlayer.speakText(lastTutorMsg.text)
+            speak(lastTutorMsg.text)
         }
     }
 
@@ -431,6 +458,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopAllAudio() {
         audioRecorder.stopRecording(flushRemaining = false)
+        speakJob?.cancel()
         audioPlayer.stop()
         _uiState.update { it.copy(isRecording = false, isAiSpeaking = false, amplitude = 0f, aiAmplitude = 0f) }
     }

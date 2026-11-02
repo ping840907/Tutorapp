@@ -7,8 +7,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * 對話引擎：ASR (使用者說了什麼) → LLM (NPC 回覆 + 結構化評分/目標判定)，
- * 由 [MissionStateMachine] 驗證並記錄。回覆語音由 App 層的系統 TTS 念出。
+ * 對話引擎：LFM3 ASR (使用者說了什麼) → LFM3 對話 (NPC 回覆 + 結構化評分/目標判定)，
+ * 由 [MissionStateMachine] 驗證並記錄。回覆語音由 LFM3 TTS 合成。
  */
 class LfmSpeechToSpeechEngine(
     private val backend: LfmBackend,
@@ -68,6 +68,8 @@ class LfmSpeechToSpeechEngine(
     }
 
     suspend fun generateGreeting(scenario: Scenario): String = backend.generateGreeting(scenario)
+
+    suspend fun synthesizeSpeech(text: String, language: String): FloatArray = backend.synthesizeSpeech(text, language)
 
     fun release() = backend.release()
 }

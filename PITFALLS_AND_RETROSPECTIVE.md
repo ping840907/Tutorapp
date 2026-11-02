@@ -74,12 +74,13 @@
 
 ---
 
-## 5. 後續修正 (改用 Verbead 已驗證的鏈路)
+## 5. 後續修正 (改用 Verbead 的 LFM3 GGUF 實作)
 
-上述「修復」並未真正解決問題：`OnnxLfmAudioBackend` 自行手刻 LFM3 ONNX 推論迴圈，推論失敗時 `ensureStructuredOutput` /
+先前「修復」並未真正解決問題：`OnnxLfmAudioBackend` 自行手刻 LFM3 ONNX 推論迴圈，推論失敗時 `ensureStructuredOutput` /
 `decodeSpokenAudioToTranscript` 會**依音訊長度編造使用者的話** (例如 "I'd like an oat milk latte, please.")，並由
-`generateDynamicInCharacterReply` 套模板回覆，所以 ASR 結果永遠被硬編碼對話蓋掉；神經 vocoder 的輸出仍是雜訊。
+`generateDynamicInCharacterReply` 套模板回覆，所以 ASR 結果永遠被硬編碼對話蓋掉；神經 vocoder 輸出則是雜訊。
 
-最終做法：整套刪除自製後端 (`OnnxLfmAudioBackend` / `Lfm3Tokenizer` / `LiquidCodecVocoder`)，改為
-Qwen3-ASR (sherpa-onnx) → Qwen3.5 (llama.cpp) → 系統 TextToSpeech，與 Verbead 一致。
-使用者的 transcript 一律以 ASR/手動輸入為準 (引擎會覆蓋模型 verdict 內的 transcript)；任何失敗都顯示錯誤，不補對白。
+Verbead 的 `main` 與早期 ONNX 版本也沒有可用的 LFM3 (ASR 為假字串、回覆為關鍵字模板、聲音走系統 TTS)；
+真正可用的是 `exp/lfm3-audio-2b` 後期的 **GGUF + 預編譯 llama.cpp 執行檔** 版本。Tutorapp 已整套移植：
+LFM3 ASR → LFM3 對話/評分 → LFM3 TTS，刪除自製 ONNX 後端與 vocoder，不再有任何其他模型或系統語音服務。
+使用者的 transcript 一律以 ASR/手動輸入為準；任何失敗都顯示錯誤，不補對白。

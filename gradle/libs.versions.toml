@@ -1,6 +1,6 @@
 [versions]
 agp = "8.6.1"
-kotlin = "2.2.0"
+kotlin = "2.0.21"
 coreKtx = "1.13.1"
 lifecycleRuntimeKtx = "2.8.6"
 activityCompose = "1.9.3"
@@ -8,7 +8,6 @@ composeBom = "2024.10.00"
 coroutines = "1.9.0"
 gson = "2.11.0"
 materialIconsExtended = "1.7.4"
-onnxruntime = "1.28.0"
 junit = "4.13.2"
 
 [libraries]
@@ -28,8 +27,6 @@ androidx-material-icons-extended = { group = "androidx.compose.material", name =
 kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 
-# ONNX Runtime for LFM3 on-device inference
-onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
 
 # JSON Serialization
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }

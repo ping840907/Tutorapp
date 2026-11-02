@@ -127,13 +127,9 @@ fun ScenarioSelectScreen(
             Spacer(modifier = Modifier.height(10.dp))
 
             // 模型檔案就緒狀態引導卡片
-            val isModelReady = remember {
-                val paths = listOf(
-                    "/sdcard/Android/data/com.tutorapp.fluenttutor/files/models/lfm3_audio/decoder_q4.onnx",
-                    "/data/local/tmp/lfm3_audio/decoder_q4.onnx"
-                )
-                paths.any { java.io.File(it).exists() }
-            }
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val missingModelFiles = remember { com.tutorapp.fluenttutor.engine.ModelStore.missingFiles(context) }
+            val isModelReady = missingModelFiles.isEmpty()
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -155,9 +151,9 @@ fun ScenarioSelectScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = if (isModelReady) {
-                            "端側 2B 模型檔案已就緒 (ONNX Runtime 1.28.0 • 4 核心並行)"
+                            "LFM3-Audio-2B GGUF 模型檔案已就緒"
                         } else {
-                            "模型路徑: /sdcard/Android/data/com.tutorapp.fluenttutor/files/models/lfm3_audio/"
+                            "缺少模型檔 (請複製到):\n" + missingModelFiles.joinToString("\n")
                         },
                         fontSize = 11.sp,
                         color = if (isModelReady) SecondaryTeal else TextSecondary

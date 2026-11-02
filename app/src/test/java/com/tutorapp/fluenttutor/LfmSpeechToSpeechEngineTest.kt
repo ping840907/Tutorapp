@@ -60,6 +60,7 @@ class LfmSpeechToSpeechEngineTest {
             return LfmRawResponse(userTranscript, text)
         }
         override suspend fun generateGreeting(scenario: Scenario) = "unused"
+        override suspend fun synthesizeSpeech(text: String, language: String) = FloatArray(0)
         override fun release() {}
     }
 
@@ -119,5 +120,12 @@ class LfmSpeechToSpeechEngineTest {
         val result = engine.process(null, scenario, scenario.goals, emptyList(), "hi")
         assertNull(result.output)
         assertEquals("Welcome!", result.replyText)
+    }
+
+    @Test
+    fun runnerStripsLogLinesAndSpecialTokensButKeepsNewlines() {
+        val raw = "0.00.123.456 I load_backend: loaded\n<|im_start|>Sure, one latte.\n<verdict>{\"off_topic\":false}</verdict><|im_end|>\n"
+        val cleaned = com.tutorapp.fluenttutor.engine.Lfm3GgufRunner.cleanStdout(raw)
+        assertEquals("Sure, one latte.\n<verdict>{\"off_topic\":false}</verdict>", cleaned)
     }
 }

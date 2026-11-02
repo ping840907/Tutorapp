@@ -10,7 +10,9 @@ data class Scenario(
     val systemPrompt: String,
     val goals: List<MissionGoal>,
     val maxOffTopicStrikes: Int = 3,
-    val maxTurns: Int = 10
+    val maxTurns: Int = 10,
+    /** 傳給 LFM3 TTS 的 --tts-lang (如 English / Japanese / Korean / Chinese) */
+    val ttsLanguage: String = "English"
 ) {
     companion object {
         fun getPredefinedEnglishScenarios(): List<Scenario> = listOf(
