@@ -4,6 +4,7 @@ import com.tutorapp.fluenttutor.engine.MissionStateMachine
 import com.tutorapp.fluenttutor.engine.ModelOutputParser
 import com.tutorapp.fluenttutor.engine.ModelTurnOutput
 import com.tutorapp.fluenttutor.model.MissionStatus
+import com.tutorapp.fluenttutor.model.NpcEmotion
 import com.tutorapp.fluenttutor.model.Scenario
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -30,8 +31,9 @@ class MissionStateMachineTest {
         goals: List<String> = emptyList(),
         relevance: Int = 80,
         fluency: Int = 80,
+        emotion: NpcEmotion = NpcEmotion.HAPPY_ENCOURAGING,
         feedback: String = ""
-    ) = ModelTurnOutput(transcript, "ok", onTopic, goals, relevance, fluency, feedback)
+    ) = ModelTurnOutput(transcript, "ok", onTopic, goals, relevance, fluency, emotion, feedback)
 
     @Test
     fun goalsCompleteInOrderAndMissionPasses() {

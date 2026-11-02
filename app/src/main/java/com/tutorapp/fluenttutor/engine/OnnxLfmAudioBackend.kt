@@ -7,6 +7,7 @@ import android.content.Context
 import android.util.Log
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import com.tutorapp.fluenttutor.model.NpcEmotion
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -163,6 +164,7 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
         verdict.add("goals", goalsArray)
         verdict.addProperty("relevance", evaluation.relevance)
         verdict.addProperty("fluency", evaluation.fluency)
+        verdict.addProperty("emotion", evaluation.emotion.name)
         verdict.addProperty("feedback", evaluation.feedback)
 
         // 3. LFM3 神經語音直出合成 (codec_decoder.onnx 產生 24kHz PCM 語音)
@@ -242,6 +244,7 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
         val achievedGoalIds: List<String>,
         val relevance: Int,
         val fluency: Int,
+        val emotion: NpcEmotion,
         val feedback: String
     )
 
@@ -265,6 +268,7 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
                 achievedGoalIds = emptyList(),
                 relevance = 25,
                 fluency = 80,
+                emotion = NpcEmotion.CONFUSED_WARNING,
                 feedback = "Notice: That utterance appeared off-topic. Please stay in character for this roleplay mission."
             )
         }
@@ -306,12 +310,18 @@ class OnnxLfmAudioBackend(private val context: Context) : LfmBackend {
             else -> "Good response! Adding polite expressions like 'please' or 'could I' will sound even more natural."
         }
 
+        val assignedEmotion = when {
+            achieved.isNotEmpty() -> NpcEmotion.EXCITED_PROUD
+            else -> NpcEmotion.HAPPY_ENCOURAGING
+        }
+
         return UtteranceEval(
             replyText = replyText,
             isOffTopic = false,
             achievedGoalIds = achieved,
             relevance = relevance,
             fluency = fluency,
+            emotion = assignedEmotion,
             feedback = feedback
         )
     }

@@ -310,13 +310,11 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
         val evaluation = newState.evaluations.last()
         val newStatus = newState.status
 
-        // 4. NPC 臉部表情
+        // 4. NPC 臉部表情：完全由模型輸出指定的 output.emotion 驅動 (終止狀態作安全防護)
         val updatedEmotion = when {
             newStatus == MissionStatus.PASSED -> NpcEmotion.EXCITED_PROUD
             newStatus == MissionStatus.FAILED -> NpcEmotion.DISAPPOINTED_FAILED
-            evaluation.isOffTopic -> NpcEmotion.CONFUSED_WARNING
-            evaluation.completedGoalIds.isNotEmpty() -> NpcEmotion.EXCITED_PROUD
-            else -> NpcEmotion.HAPPY_ENCOURAGING
+            else -> output.emotion
         }
 
         // 5. 任務終止：停止收音並結算
@@ -325,7 +323,7 @@ class TutorViewModel(application: Application) : AndroidViewModel(application) {
             audioRecorder.stopRecording(flushRemaining = false)
         }
 
-        // 6. 更新對話 UI (原子更新)
+        // 6. 原子更新 UI：確保回覆文字、目標狀態/分數、NPC 表情在使用者視角同時生效
         val userMsg = ChatMessage(
             sender = MessageSender.USER,
             text = output.transcript,

@@ -23,9 +23,15 @@ object LfmPromptBuilder {
             - "off_topic" is true only if the utterance has nothing to do with this scenario.
             - If you could not understand the learner, set "transcript" to "" and ask them to repeat.
             - "relevance" and "fluency" are integers 0-100 for this utterance.
+            - "emotion" specifies your facial emotion for this turn, choose exactly one from:
+              * "WELCOMING" (initial friendly greeting)
+              * "HAPPY_ENCOURAGING" (normal progress, positive engagement)
+              * "EXCITED_PROUD" (target goal achieved or outstanding performance)
+              * "CONFUSED_WARNING" (off-topic utterance or clarification needed)
+              * "DISAPPOINTED_FAILED" (repeated failures or mission termination)
 
             After your spoken reply, output exactly one final block:
-            <verdict>{"transcript":"<what the learner said>","off_topic":false,"goals":[],"relevance":0,"fluency":0,"feedback":"<one short tip in English>"}</verdict>
+            <verdict>{"transcript":"<what the learner said>","off_topic":false,"goals":[],"relevance":0,"fluency":0,"emotion":"HAPPY_ENCOURAGING","feedback":"<one short tip in English>"}</verdict>
         """.trimIndent()
     }
 }

@@ -7,6 +7,7 @@ import com.tutorapp.fluenttutor.engine.LfmRequest
 import com.tutorapp.fluenttutor.engine.LfmSpeechToSpeechEngine
 import kotlinx.coroutines.runBlocking
 import com.tutorapp.fluenttutor.model.NpcAvatarStyle
+import com.tutorapp.fluenttutor.model.NpcEmotion
 import com.tutorapp.fluenttutor.model.NpcInteractionState
 import com.tutorapp.fluenttutor.model.Scenario
 import com.tutorapp.fluenttutor.ui.viewmodel.TutorUiState
@@ -126,5 +127,22 @@ class LfmSpeechToSpeechEngineTest {
         val result = engine.process(null, scenario, scenario.goals, emptyList(), "hi")
         assertNull(result.output)
         assertEquals("Just chatting", result.replyText)
+    }
+
+    @Test
+    fun engineParsesEmotionAndOutputsSynchronously() = runBlocking {
+        val scenario = Scenario.getPredefinedEnglishScenarios().first()
+        val backend = FakeBackend(
+            "Certainly!\n<verdict>{\"transcript\":\"an oat latte\",\"off_topic\":false,\"goals\":[\"goal_drink_oat\"],\"relevance\":95,\"fluency\":90,\"emotion\":\"EXCITED_PROUD\",\"feedback\":\"Great choice\"}</verdict>"
+        )
+        val engine = LfmSpeechToSpeechEngine(backend) { 0L }
+        val result = engine.process(null, scenario, scenario.goals, emptyList(), "an oat latte")
+
+        assertNotNull(result.output)
+        assertEquals("Certainly!", result.replyText)
+        assertEquals(listOf("goal_drink_oat"), result.output!!.completedGoalIds)
+        assertEquals(95, result.output!!.relevance)
+        assertEquals(90, result.output!!.fluency)
+        assertEquals(NpcEmotion.EXCITED_PROUD, result.output!!.emotion)
     }
 }
